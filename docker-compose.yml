@@ -1,0 +1,154 @@
+# BGP pipeline - stages 1-2: broker, serving database, producer, Spark streaming job.
+# The same file runs on the laptop and on the server; only .env differs.
+# Every port is bound to 127.0.0.1, so nothing is reachable from outside
+# the machine. Public access is added later through a reverse proxy.
+
+name: bgp-pipeline
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:-v24.2.7}
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=${REDPANDA_MEMORY:-1G}
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "127.0.0.1:19092:19092"   # Kafka API for tools running on the host
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # Creates the topic once, with retention caps so disk use stays bounded.
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:-v24.2.7}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        rpk topic describe "${KAFKA_TOPIC}" -X brokers=redpanda:9092 >/dev/null 2>&1 \
+        || rpk topic create "${KAFKA_TOPIC}" \
+             --partitions 3 \
+             --topic-config retention.ms=${TOPIC_RETENTION_MS:-21600000} \
+             --topic-config retention.bytes=${TOPIC_RETENTION_BYTES:-1073741824} \
+             -X brokers=redpanda:9092
+    restart: "no"
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  # Applies postgres/init/*.sql on every start. Every statement is idempotent,
+  # so this also upgrades a database that already exists from an earlier stage.
+  db-migrate:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    volumes:
+      - ./postgres/init:/init:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["for f in /init/*.sql; do psql -v ON_ERROR_STOP=1 -q -f \"$$f\" || exit 1; done"]
+    restart: "no"
+
+  # Spark Structured Streaming: Kafka -> Delta (bronze, silver) -> Postgres (gold).
+  # The first start downloads connector jars (about 1-2 minutes), cached afterwards.
+  spark:
+    image: apache/spark:3.5.3-scala2.12-java17-python3-ubuntu
+    user: root
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      LAKE_PATH: /data/lake
+      CHECKPOINT_PATH: /data/checkpoints/ingest
+      TRIGGER_SECONDS: ${TRIGGER_SECONDS:-30}
+      MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-50000}
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master=local[2]
+      - --driver-memory=${SPARK_DRIVER_MEMORY:-2g}
+      - --driver-java-options=-Duser.timezone=UTC
+      - --conf=spark.jars.ivy=/tmp/ivy
+      - --packages=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,io.delta:delta-spark_2.12:3.2.0,org.postgresql:postgresql:42.7.4
+      - /app/stream_job.py
+    volumes:
+      - ./spark:/app:ro
+      - lake-data:/data
+      - spark-ivy:/tmp/ivy
+    mem_limit: ${SPARK_CONTAINER_MEMORY:-3g}
+    restart: unless-stopped
+
+  producer:
+    build: ./producer
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      RIS_CLIENT: ${RIS_CLIENT}
+      RIS_HOSTS: ${RIS_HOSTS:-}
+      SAMPLE_EVERY: ${SAMPLE_EVERY:-50}
+    mem_limit: 256m
+    restart: unless-stopped
+
+  # Web UI to look at topics and messages. Local use only:
+  #   docker compose --profile tools up -d console   ->  http://localhost:8080
+  console:
+    image: docker.redpanda.com/redpandadata/console:${CONSOLE_VERSION:-v2.7.2}
+    profiles: ["tools"]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  redpanda-data:
+  postgres-data:
+  lake-data:
+  spark-ivy:
