@@ -28,7 +28,7 @@ import transforms as T
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "redpanda:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "ris.updates.raw")
 LAKE = os.environ.get("LAKE_PATH", "/data/lake")
-CHECKPOINT = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints/ingest")
+CHECKPOINT = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints/ingest")   # local FS, see README
 TRIGGER_SECONDS = int(os.environ.get("TRIGGER_SECONDS", "30"))
 MAX_OFFSETS = int(os.environ.get("MAX_OFFSETS_PER_TRIGGER", "200000"))
 LAKE_FORMAT = os.environ.get("LAKE_FORMAT", "delta")   # tests use "parquet"
@@ -41,6 +41,7 @@ PG_URL = f"jdbc:postgresql://{PG_HOST}:5432/{PG_DB}"
 
 BRONZE = f"{LAKE}/bronze/ris_raw"
 SILVER = f"{LAKE}/silver/prefix_events"
+EDGES_DAILY = f"{LAKE}/gold/as_edges_daily"      # built by maintenance.py
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -48,17 +49,40 @@ log = logging.getLogger("stream_job")
 logging.getLogger("py4j").setLevel(logging.WARNING)   # hide Spark-internal chatter
 
 
-def build_spark() -> SparkSession:
-    return (
-        SparkSession.builder.appName("bgp-stream")
+def build_spark(app_name: str = "bgp-stream") -> SparkSession:
+    """SparkSession with Delta enabled and S3A pointed at our object store.
+
+    S3_* variables are optional: when LAKE_PATH is a plain directory (tests,
+    or a Docker-volume fallback) they are simply not used.
+    """
+    b = (
+        SparkSession.builder.appName(app_name)
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.sql.catalog.spark_catalog",
                 "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", "4")   # default 200 is far too many for one machine
         .config("spark.ui.showConsoleProgress", "false")
-        .getOrCreate()
+        # Keep Delta's own retention logic honest: we never want to vacuum below 7 days
+        # by accident, so maintenance.py sets the check explicitly when it does.
     )
+    endpoint = os.environ.get("S3_ENDPOINT")
+    if endpoint:
+        b = (b.config("spark.hadoop.fs.s3a.endpoint", endpoint)
+              .config("spark.hadoop.fs.s3a.access.key", os.environ["S3_ACCESS_KEY"])
+              .config("spark.hadoop.fs.s3a.secret.key", os.environ["S3_SECRET_KEY"])
+              .config("spark.hadoop.fs.s3a.path.style.access", "true")
+              .config("spark.hadoop.fs.s3a.connection.ssl.enabled",
+                      str(endpoint.startswith("https")).lower())
+              .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+              .config("spark.hadoop.fs.s3a.aws.credentials.provider",
+                      "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+              # Delta on S3 needs a log store that gives atomic "put if absent";
+              # with a single writer per table the S3A store is safe.
+              .config("spark.delta.logStore.s3a.impl", "io.delta.storage.S3SingleDriverLogStore")
+              .config("spark.hadoop.fs.s3a.committer.name", "directory")
+              .config("spark.hadoop.fs.s3a.fast.upload", "true"))
+    return b.getOrCreate()
 
 
 # --- Postgres helpers --------------------------------------------------------
@@ -148,6 +172,7 @@ def process_batch(batch: DataFrame, batch_id: int) -> None:
     n_events = events.count()
     (events.write.format(LAKE_FORMAT).mode("append").partitionBy("dt")
         .option("txnAppId", "bgp-silver").option("txnVersion", batch_id)   # idempotent on replay
+        .option("mergeSchema", "true")   # lets us add columns (e.g. as_path) without a rebuild
         .save(SILVER))
 
     # 3) gold: recompute the windows this batch touched, from the full silver table

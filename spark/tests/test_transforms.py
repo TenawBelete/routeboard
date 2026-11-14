@@ -78,6 +78,31 @@ def test_origin_and_path_length(spark):
     assert wd.origin_asn is None and wd.path_length is None
 
 
+def test_as_path_kept_for_announcements_only(spark):
+    rows = {r.prefix: r for r in silver(spark).collect()}
+    assert rows["10.0.0.0/24"].as_path == [3333, 1103, 12859]
+    assert rows["192.0.2.0/24"].as_path == [174, 3356, 64500, 64501]   # AS_SET flattened
+    assert rows["203.0.113.0/24"].as_path is None                       # withdrawal
+
+
+def test_as_edges_daily(spark):
+    edges = {(r.src, r.dst): r.weight for r in T.as_edges_daily(silver(spark)).collect()}
+    # two prefixes share path 3333->1103->12859, so those links weigh 2
+    assert edges[(3333, 1103)] == 2 and edges[(1103, 12859)] == 2
+    assert edges[(174, 3356)] == 1 and edges[(3356, 64500)] == 1 and edges[(64500, 64501)] == 1
+    assert all(s != d for s, d in edges)
+
+
+def test_self_loops_removed(spark):
+    raw = spark.createDataFrame(
+        [(msg(T0, 3356, [3356, 3356, 3356, 15169],
+              ann=[{"next_hop": "1.1.1.1", "prefixes": ["8.8.8.0/24"]}]),)], ["raw_json"])
+    s = T.explode_events(T.parse_messages(raw))
+    assert s.first().path_length == 4
+    edges = [(r.src, r.dst, r.weight) for r in T.as_edges_daily(s).collect()]
+    assert edges == [(3356, 15169, 1)]
+
+
 def test_peer_asn_is_numeric(spark):
     assert {r.peer_asn for r in silver(spark).collect()} == {3333, 174}
 

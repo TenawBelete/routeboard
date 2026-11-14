@@ -29,7 +29,7 @@ MESSAGE_SCHEMA = StructType([
 
 SILVER_COLUMNS = [
     "event_time", "dt", "host", "peer_asn", "event_type",
-    "prefix", "origin_asn", "path_length",
+    "prefix", "origin_asn", "path_length", "as_path",
 ]
 
 
@@ -46,19 +46,26 @@ def parse_messages(raw: DataFrame) -> DataFrame:
             F.col("msg.data.peer_asn").cast("long").alias("peer_asn"),
             # Last number in the path = origin AS (works when it ends in an AS_SET too).
             F.regexp_extract(path_json, r"(\d+)\D*$", 1).alias("_origin"),
-            # Count of numbers in the path; a rough path length.
-            F.size(F.split(F.regexp_replace(path_json, r"[^\d,\[]", ""), ",")).alias("_plen"),
+            # Flattened path as numbers. AS_SETs ({} / nested []) are flattened in
+            # order, so consecutive pairs are still a usable approximation for
+            # the AS graph. Prepended duplicates (e.g. 3356 3356 3356) are kept;
+            # the edge summary removes self-links.
+            F.filter(
+                F.transform(F.split(F.regexp_replace(path_json, r"[^\d,]", ""), ","),
+                            lambda x: x.cast("long")),
+                lambda x: x.isNotNull()).alias("_path"),
             path_json.isNotNull().alias("_has_path"),
             F.col("msg.data.announcements").alias("announcements"),
             F.col("msg.data.withdrawals").alias("withdrawals"),
         )
+        .withColumn("_plen", F.size("_path"))
         .where(F.col("event_time").isNotNull() & F.col("peer_asn").isNotNull())
     )
 
 
 def explode_events(messages: DataFrame) -> DataFrame:
     """One row per (message, prefix), labelled announce 'A' or withdraw 'W'."""
-    base = ["event_time", "host", "peer_asn", "_origin", "_plen", "_has_path"]
+    base = ["event_time", "host", "peer_asn", "_origin", "_plen", "_has_path", "_path"]
 
     announced = (
         messages
@@ -87,6 +94,8 @@ def explode_events(messages: DataFrame) -> DataFrame:
                F.col("_origin").cast("long")).alias("origin_asn"),
         F.when((F.col("event_type") == "A") & F.col("_has_path"),
                F.col("_plen")).alias("path_length"),
+        F.when((F.col("event_type") == "A") & F.col("_has_path"),
+               F.col("_path")).alias("as_path"),
     )
 
 
@@ -128,3 +137,24 @@ def kpi_origins_5m(silver: DataFrame) -> DataFrame:
         .groupBy(five_minute_of("event_time").alias("window_start"), "origin_asn")
         .agg(F.count("*").alias("announcements"))
     )
+
+
+def as_edges_daily(silver: DataFrame) -> DataFrame:
+    """Per day: directed AS-to-AS links from consecutive path entries, with how
+    many announcements carried each link. This is the compact, keep-forever
+    summary the graph stage reads; it is what lets raw silver rows expire."""
+    pairs = (
+        silver
+        .where((F.col("event_type") == "A") & (F.size("as_path") >= 2))
+        .select(
+            "dt",
+            F.explode(
+                F.transform(
+                    F.sequence(F.lit(0), F.size("as_path") - 2),
+                    lambda i: F.struct(F.col("as_path")[i].alias("src"),
+                                       F.col("as_path")[i + 1].alias("dst")))
+            ).alias("e"))
+        .select("dt", "e.src", "e.dst")
+        .where(F.col("src") != F.col("dst"))           # drop prepend self-loops
+    )
+    return pairs.groupBy("dt", "src", "dst").agg(F.count("*").alias("weight"))

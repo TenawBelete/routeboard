@@ -1,4 +1,5 @@
-# BGP pipeline - stages 1-2: broker, serving database, producer, Spark streaming job.
+# BGP pipeline - stages 1-2b: broker, producer, object storage, Spark streaming job,
+# serving database, nightly maintenance.
 # The same file runs on the laptop and on the server; only .env differs.
 # Every port is bound to 127.0.0.1, so nothing is reachable from outside
 # the machine. Public access is added later through a reverse proxy.
@@ -49,6 +50,81 @@ services:
              -X brokers=redpanda:9092
     restart: "no"
 
+  # S3-compatible object storage for the lake (bronze/silver/gold Delta tables). One process runs master + volume + filer + S3 gateway.
+  # Credentials come from s3/config.json, rendered from .env by s3-init.
+  seaweedfs:
+    image: chrislusf/seaweedfs:${SEAWEEDFS_VERSION:-3.80}
+    command:
+      - server
+      - -dir=/data
+      - -ip=seaweedfs
+      - -ip.bind=0.0.0.0
+      - -master.volumeSizeLimitMB=1024
+      - -volume.max=0
+      - -filer
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/s3.json
+      - -s3.allowEmptyFolder=false
+    ports:
+      - "127.0.0.1:8333:8333"   # S3 API for tools on the host (aws cli, etc.)
+      - "127.0.0.1:9333:9333"   # Master UI
+    volumes:
+      - lake-data:/data
+      - s3-config:/etc/seaweedfs:ro
+    depends_on:
+      s3-config:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8333/ >/dev/null 2>&1 || wget -qO- --server-response http://127.0.0.1:8333/ 2>&1 | grep -q 'HTTP/' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # Writes the S3 credentials file from .env so the secret never lives in git.
+  s3-config:
+    image: alpine:3.20
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+    volumes:
+      - s3-config:/out
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        test -n "$$S3_ACCESS_KEY" -a -n "$$S3_SECRET_KEY" || { echo "S3_ACCESS_KEY / S3_SECRET_KEY missing in .env"; exit 1; }
+        cat > /out/s3.json <<JSON
+        {"identities":[{"name":"pipeline","credentials":[{"accessKey":"$$S3_ACCESS_KEY","secretKey":"$$S3_SECRET_KEY"}],"actions":["Admin","Read","Write","List","Tagging"]}]}
+        JSON
+        echo "s3.json written"
+    restart: "no"
+
+  # Creates the buckets once (idempotent).
+  s3-init:
+    image: amazon/aws-cli:2.22.35
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for b in lake; do
+          aws --endpoint-url http://seaweedfs:8333 s3api head-bucket --bucket $$b 2>/dev/null \
+          || aws --endpoint-url http://seaweedfs:8333 s3 mb s3://$$b
+        done
+        aws --endpoint-url http://seaweedfs:8333 s3 ls
+    restart: "no"
+
   postgres:
     image: postgres:17-alpine
     environment:
@@ -86,7 +162,7 @@ services:
 
   # Spark Structured Streaming: Kafka -> Delta (bronze, silver) -> Postgres (gold).
   # The first start downloads connector jars (about 1-2 minutes), cached afterwards.
-  spark:
+  spark: &spark-base
     image: apache/spark:3.5.3-scala2.12-java17-python3-ubuntu
     user: root
     depends_on:
@@ -94,30 +170,76 @@ services:
         condition: service_completed_successfully
       db-migrate:
         condition: service_completed_successfully
-    environment:
+      s3-init:
+        condition: service_completed_successfully
+    environment: &spark-env
       KAFKA_BOOTSTRAP: redpanda:9092
       KAFKA_TOPIC: ${KAFKA_TOPIC}
       POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      LAKE_PATH: /data/lake
-      CHECKPOINT_PATH: /data/checkpoints/ingest
+      S3_ENDPOINT: http://seaweedfs:8333
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      LAKE_PATH: s3a://lake
+      CHECKPOINT_PATH: /data/checkpoints/ingest   # local: Spark checkpoints need a real filesystem
       TRIGGER_SECONDS: ${TRIGGER_SECONDS:-30}
       MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-50000}
+      RETENTION_BRONZE_DAYS: ${RETENTION_BRONZE_DAYS:-3}
+      RETENTION_SILVER_DAYS: ${RETENTION_SILVER_DAYS:-14}
     command:
       - /opt/spark/bin/spark-submit
       - --master=local[2]
       - --driver-memory=${SPARK_DRIVER_MEMORY:-2g}
       - --driver-java-options=-Duser.timezone=UTC
       - --conf=spark.jars.ivy=/tmp/ivy
-      - --packages=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,io.delta:delta-spark_2.12:3.2.0,org.postgresql:postgresql:42.7.4
+      - --packages=${SPARK_PACKAGES}
       - /app/stream_job.py
     volumes:
       - ./spark:/app:ro
-      - lake-data:/data
       - spark-ivy:/tmp/ivy
+      - spark-checkpoints:/data/checkpoints
     mem_limit: ${SPARK_CONTAINER_MEMORY:-3g}
+    restart: unless-stopped
+
+  # Nightly maintenance: deletes expired bronze/silver data, builds the daily
+  # AS-link summary, compacts the Delta tables. Runs once and exits; the
+  # scheduler container below starts it every night. Run by hand with:
+  #   docker compose run --rm maintenance
+  maintenance:
+    <<: *spark-base
+    profiles: ["ops"]
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master=local[2]
+      - --driver-memory=${SPARK_DRIVER_MEMORY:-2g}
+      - --driver-java-options=-Duser.timezone=UTC
+      - --conf=spark.jars.ivy=/tmp/ivy
+      - --packages=${SPARK_PACKAGES}
+      - /app/maintenance.py
+    restart: "no"
+
+  # Tiny cron container that triggers `maintenance` on a schedule through the
+  # Docker socket. Schedule is in .env (MAINTENANCE_CRON, default 03:15 UTC).
+  scheduler:
+    image: docker:27-cli
+    depends_on:
+      spark:
+        condition: service_started
+    environment:
+      MAINTENANCE_CRON: ${MAINTENANCE_CRON:-15 3 * * *}
+      COMPOSE_PROJECT_NAME: bgp-pipeline
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/workspace:ro
+    working_dir: /workspace
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "$$MAINTENANCE_CRON cd /workspace && docker compose --profile ops run --rm --no-deps maintenance >> /proc/1/fd/1 2>&1" > /etc/crontabs/root
+        echo "scheduler: maintenance at '$$MAINTENANCE_CRON' (UTC)"
+        exec crond -f -l 6
     restart: unless-stopped
 
   producer:
@@ -150,5 +272,7 @@ services:
 volumes:
   redpanda-data:
   postgres-data:
-  lake-data:
+  lake-data:          # SeaweedFS data (bronze, silver, gold)
+  spark-checkpoints:  # streaming progress; must be reset together with the lake
+  s3-config:
   spark-ivy:

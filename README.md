@@ -5,21 +5,31 @@ aggregation, graph analytics and ML, served through an API and a public
 dashboard. Everything runs from one Docker Compose file, on a laptop or on a
 single cloud server.
 
-**Status: stage 2 of 7** - broker, producer, Spark streaming job, serving database.
+**Status: stage 2b of 7** - broker, producer, object storage, Spark streaming job, serving database, nightly maintenance.
 
 ## Architecture
 
 ```
 RIS Live (WebSocket)
       |
-  producer  ->  Redpanda (Kafka API)  ->  Spark Structured Streaming   [step 2]
-                                              |            |
-                                     Delta lake tables   Postgres (gold KPIs)
-                                     (object storage)        |
-                                              |           FastAPI      [step 4]
-                                      graph + ML jobs        |
-                                         [step 3]         Frontend     [step 5]
+  producer  ->  Redpanda (Kafka API)  ->  Spark Structured Streaming
+                                              |                 |
+                                   SeaweedFS (S3 API)      Postgres (gold KPIs)
+                                   bronze / silver Delta          |
+                                   gold/as_edges_daily         FastAPI      [stage 3]
+                                              |                   |
+                                   nightly maintenance         Frontend     [stage 4]
+                                   graph + ML jobs  [stage 5]
 ```
+
+Storage layers (medallion):
+
+| Layer | Where | Contents | Kept |
+|---|---|---|---|
+| Bronze | `s3a://lake/bronze/ris_raw` | raw RIS messages, as received | 3 days |
+| Silver | `s3a://lake/silver/prefix_events` | one row per announced/withdrawn prefix, with AS path | 14 days |
+| Gold (lake) | `s3a://lake/gold/as_edges_daily` | per-day AS-to-AS links with weights | forever |
+| Gold (serving) | Postgres `kpi_*` tables | 1-min and 5-min KPIs the API reads | forever |
 
 ## Run it locally
 
@@ -63,7 +73,55 @@ make spark-logs   # first start downloads connector jars, about 1-2 minutes
 make kpi          # newest KPI rows
 ```
 
-Unit tests for the transforms live in `spark/tests` (need `pip install pyspark pytest`).
+## Stage 2b: object storage and data lifecycle
+
+**SeaweedFS** provides an S3 API on the same machine, so the lake is addressed
+as `s3a://lake/...`. Moving to a cloud bucket later means changing
+`S3_ENDPOINT` and the keys, not the Spark code. MinIO was not used because its
+community edition was archived upstream in 2026.
+
+**Nightly maintenance** (`spark/maintenance.py`, scheduled by the `scheduler`
+container, default 03:15 UTC) does three things, in this order:
+
+1. Summarises every completed day of silver into `gold/as_edges_daily`
+   (directed AS links and how many announcements carried each). This table is
+   small and kept forever; it is what the graph stage reads.
+2. Deletes bronze older than `RETENTION_BRONZE_DAYS` and silver older than
+   `RETENTION_SILVER_DAYS`. A silver day is never deleted before it has been
+   summarised, whatever its age.
+3. Compacts the Delta tables (`OPTIMIZE`) and frees deleted files (`VACUUM`).
+
+Sizing, measured on 14 Nov 2026 at `SAMPLE_EVERY=50`: about 29 MB of lake per
+hour, so roughly 0.7 GB/day and ~10 GB for 14 days of silver. Sampling is the
+main storage lever; see `.env.example`.
+
+```bash
+make lake          # bucket contents and total size
+make maintenance   # run the nightly job now
+make test          # unit tests (17), needs pyspark + pytest locally
+```
+
+### Known limits
+
+- **Single writer per Delta table.** Delta on S3 relies on a single-driver log
+  store here. Only the streaming job writes bronze/silver and only maintenance
+  writes `as_edges_daily`; maintenance also deletes from bronze/silver while the
+  stream appends to them, which Delta's optimistic concurrency allows because
+  they touch different files. Running two copies of either job would corrupt
+  the log.
+- **No replication.** SeaweedFS runs with one volume server on one disk. The
+  data is public BGP data that keeps arriving, so the accepted loss on disk
+  failure is history older than what Postgres holds.
+- **Checkpoints are local, not in S3.** Spark's streaming checkpoint manager
+  needs atomic rename and real directories, which S3-style stores do not
+  provide, so it lives on the `spark-checkpoints` volume. Lake and checkpoint
+  must always be reset together (`make reset-lake`).
+- **`VACUUM` with a 1-hour retention** is safe only because this pipeline is
+  the sole reader. Raise `VACUUM_RETAIN_HOURS` if other tools read the lake.
+
+Unit tests live in `spark/tests`. They cover the transforms, the micro-batch
+(recompute-not-add semantics) and the retention decisions. Delta and S3
+operations themselves are exercised on the running stack, not in tests.
 
 ## Services
 
