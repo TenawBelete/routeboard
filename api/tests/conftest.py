@@ -10,9 +10,33 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-PGBIN = next((Path(p) for p in ["/usr/lib/postgresql/16/bin", "/usr/lib/postgresql/17/bin",
-                                "/opt/homebrew/opt/postgresql@16/bin"] if Path(p).exists()), None)
-PORT = "5599"
+def _find_pgbin():
+    """Newest PostgreSQL on this machine: Linux packages, Homebrew, or PATH."""
+    import glob
+    import shutil as _sh
+
+    def ver(p):
+        v = p.split("/")[4]
+        return int(v) if v.isdigit() else 0
+    cands = sorted(glob.glob("/usr/lib/postgresql/*/bin"), key=ver)
+    cands += sorted(glob.glob("/opt/homebrew/opt/postgresql@*/bin"))
+    cands += glob.glob("/opt/homebrew/opt/postgresql/bin")
+    for p in reversed(cands):
+        if Path(p, "initdb").exists():
+            return Path(p)
+    found = _sh.which("initdb")
+    return Path(found).parent if found else None
+
+
+def _free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return str(s.getsockname()[1])
+
+
+PGBIN = _find_pgbin()
+PORT = _free_port()
 
 
 def _run(cmd, **kw):
@@ -22,7 +46,7 @@ def _run(cmd, **kw):
 @pytest.fixture(scope="session")
 def pg():
     if PGBIN is None:
-        pytest.skip("no PostgreSQL binaries found")
+        pytest.fail("PostgreSQL (initdb) not found; install postgresql to run these tests")
     d = Path(tempfile.mkdtemp(prefix="pgapi-"))
     sock = d / "sock"; sock.mkdir()
     as_user = []

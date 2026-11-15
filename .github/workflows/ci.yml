@@ -7,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: sudo apt-get install -y postgresql postgresql-contrib
+      - run: sudo apt-get update && sudo apt-get install -y postgresql postgresql-contrib && ls /usr/lib/postgresql/
       - run: pip install -r api/requirements.txt -r analytics/requirements.txt -r live/requirements.txt pytest httpx
       - run: cd api && python -m pytest -q
       - run: cd analytics && python -m pytest -q
