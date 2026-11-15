@@ -5,7 +5,7 @@ aggregation, graph analytics and ML, served through an API and a public
 dashboard. Everything runs from one Docker Compose file, on a laptop or on a
 single cloud server.
 
-**Status: stage 2b of 7** - broker, producer, object storage, Spark streaming job, serving database, nightly maintenance.
+**Status: complete** - ingestion, streaming, lakehouse, serving database, API, graph analytics, risk model and website.
 
 ## Architecture
 
@@ -15,11 +15,12 @@ RIS Live (WebSocket)
   producer  ->  Redpanda (Kafka API)  ->  Spark Structured Streaming
                                               |                 |
                                    SeaweedFS (S3 API)      Postgres (gold KPIs)
-                                   bronze / silver Delta          |
-                                   gold/as_edges_daily         FastAPI      [stage 3]
-                                              |                   |
-                                   nightly maintenance         Frontend     [stage 4]
-                                   graph + ML jobs  [stage 5]
+                                   bronze / silver Delta          |   ^
+                                   gold/as_edges_daily         FastAPI  |
+                                              |                   |     |
+                                   graph job (hourly) ------------+-----+  analytics: graph + risk model
+                                   risk model (6-hourly) reads Postgres
+                                                              Caddy + React website
 ```
 
 Storage layers (medallion):
@@ -36,21 +37,19 @@ Storage layers (medallion):
 Requires Docker Desktop (Apple Silicon is supported; all images are multi-arch).
 
 ```bash
-cp .env.example .env        # then set RIS_CLIENT to something that names you
-make up                     # build and start
-make logs                   # watch the producer; a stats line every 30s
-make peek                   # print 3 messages from the topic
+make setup       # creates .env with random secrets (first time only)
+make up          # build and start everything (first start: 5-10 minutes)
+make health      # all services running? is the data fresh?
 ```
 
-Expected producer log:
+Open **http://localhost:3000**. Live numbers appear after about 2 minutes; the
+graph page after ~10 minutes; the risk model after a few hours of data.
+Something wrong? See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+Putting it on the internet: [docs/DEPLOY_HETZNER.md](docs/DEPLOY_HETZNER.md).
 
-```
-subscribed (hosts=all, sample_every=50)
-received=41250 produced=825 delivered=825 failed=0 skipped=0
-```
-
-Other commands: `make console` (web UI at http://localhost:8080), `make psql`,
-`make down` (stop, keep data), `make clean` (stop and delete data).
+Other commands: `make logs`, `make spark-logs`, `make peek`, `make lake`,
+`make console` (Redpanda UI, :8080), `make psql`, `make down` (keep data),
+`make clean` (delete data), `make test`, `make backup`.
 
 ## Stage 2: what the Spark job does
 
@@ -80,8 +79,8 @@ as `s3a://lake/...`. Moving to a cloud bucket later means changing
 `S3_ENDPOINT` and the keys, not the Spark code. MinIO was not used because its
 community edition was archived upstream in 2026.
 
-**Nightly maintenance** (`spark/maintenance.py`, scheduled by the `scheduler`
-container, default 03:15 UTC) does three things, in this order:
+**Nightly maintenance** (`spark/maintenance.py`, run by a thread inside the
+streaming job, daily at 03:15 UTC) does three things, in this order:
 
 1. Summarises every completed day of silver into `gold/as_edges_daily`
    (directed AS links and how many announcements carried each). This table is
@@ -104,11 +103,9 @@ make test          # unit tests (17), needs pyspark + pytest locally
 ### Known limits
 
 - **Single writer per Delta table.** Delta on S3 relies on a single-driver log
-  store here. Only the streaming job writes bronze/silver and only maintenance
-  writes `as_edges_daily`; maintenance also deletes from bronze/silver while the
-  stream appends to them, which Delta's optimistic concurrency allows because
-  they touch different files. Running two copies of either job would corrupt
-  the log.
+  store, which is only safe with one writer process. That is why maintenance
+  runs as a thread inside the streaming job instead of as a second Spark
+  application. Never start a second copy of the `spark` service.
 - **No replication.** SeaweedFS runs with one volume server on one disk. The
   data is public BGP data that keeps arriving, so the accepted loss on disk
   failure is history older than what Postgres holds.
@@ -133,6 +130,10 @@ operations themselves are exercised on the running stack, not in tests.
 | `postgres` | Serving layer for the API | `localhost:5432` |
 | `db-migrate` | Applies `postgres/init/*.sql` on every start, then exits | - |
 | `spark` | Kafka -> Delta bronze/silver -> Postgres gold KPIs | - |
+| `api` | Read-only JSON API (docs at `/api/docs`) | `localhost:8000` |
+| `analytics` | Hourly graph job, six-hourly risk model, names, event detection | - |
+| `live` | Kafka -> browsers, live route changes (SSE) | - |
+| `web` | React site + Caddy reverse proxy | `localhost:3000` |
 | `console` | Topic browser (local only, `tools` profile) | `localhost:8080` |
 
 Inside the Compose network services address each other by name
@@ -151,12 +152,59 @@ All settings live in `.env` (see `.env.example`).
 
 ## Deploying to the server
 
-1. Install Docker on the server and clone this repo.
-2. Create `.env` there with a strong `POSTGRES_PASSWORD`.
-3. `docker compose up -d --build`
+See [docs/DEPLOY_HETZNER.md](docs/DEPLOY_HETZNER.md). In short: install Docker,
+clone the repo, `make setup`, set `SITE_ADDRESS` to your domain, `make prod-up`.
+Only ports 80/443 (the website) are public; Postgres, the broker, the object
+store and the API are not reachable from outside.
 
-No ports are exposed publicly: every port binds to `127.0.0.1`. Public HTTPS
-access is added with a reverse proxy in step 6.
+## Stages 3-5: API, analytics, website
+
+- **API** (`api/`): FastAPI over the gold tables. The database session is forced
+  read-only, responses carry short cache headers, and `/health` reports how old
+  the newest data is (`ok` / `degraded` / `down`).
+- **Graph job** (`analytics/graph_job.py`, hourly): reads the last 24 h of silver,
+  builds weighted directed AS links, computes PageRank, degrees, hub score and
+  components with NetworkX. NetworkX instead of GraphFrames: same PageRank, no
+  extra package to resolve at start-up, and the ~30k-node AS graph fits in memory.
+- **Risk model** (`analytics/model_job.py`, every 6 h): logistic regression
+  predicting whether a peer's next-5-minute withdrawal rate is elevated. Time-based
+  split (never shuffled), compared with a no-skill baseline, and it reports
+  "not enough data" instead of a number when there is too little history.
+  The original notebook's AUC of 0.99 came from a random split and features that
+  included the future; this version measures what it can honestly predict.
+- **Names and lookup**: `analytics/names_job.py` downloads the public RIPE NCC list of network names and
+  countries once a day into `asn_names`, so the site says "Google" instead of "AS15169". The API adds
+  `/api/search`, `/api/network/{asn}` (one network's rank, neighbours, 24 h activity, risk) and
+  `/api/briefing` (plain-language events computed from the KPI tables: bursts of withdrawals against the
+  24 h median, networks far above their own usual, activity by country).
+- **Live stream** (`live/`): a small service that reads the same Kafka topic as Spark (no consumer group,
+  newest messages only, stateless) and pushes to browsers over Server-Sent Events: a counter every second,
+  a few route changes in words, and four times a second the paths of up to 120 route changes a second, which
+  drive the map animations. It also keeps the last 60 real changes per country, replayed (and labelled as a
+  replay) when a country is quiet. A slow browser drops messages instead of delaying others, and
+  the number of viewers is capped. The site's per-second chart, the wire and the moving dots on the map
+  are driven by it; nothing on the map moves unless a real route change crossed that link.
+- **Countries**: `/api/country/{cc}` groups the latest map by the country each network is registered in:
+  which foreign networks and countries carry routes into it, how concentrated that is, the country's
+  24 h activity and events. The page draws it on a self-hosted world map: Natural Earth 1:50m shapes adjusted by
+  `web/scripts/build-world.mjs` to UN-recognised borders (Somaliland within Somalia, Northern Cyprus within
+  Cyprus, Crimea within Ukraine, Western Sahara whole and separate), with a build-time check for inverted shapes.
+  Links seen over the last 7 days are used, and a country with fewer than 30 observed routes shows no percentages.
+  This is routing (which paths exist), not traffic volume or content, and the pages say so.
+- **Events**: `analytics/events_job.py` runs every 5 minutes and records two kinds of event in the `events`
+  table: a *burst* (routes closed in a minute above median + 8 x MAD of the last 24 h and at least 4 x the
+  median) and a *surge* (one network at 5 x its own typical hour). Detection is idempotent (upsert on kind,
+  start, network). Every event has a permanent page (`/event/<id>`), a list (`/events`) and an Atom feed
+  (`/api/events.atom`).
+- **Least privilege**: when `API_DB_PASSWORD` is set (`./scripts/setup.sh` adds it), the migration creates a
+  `bgp_api` login with `SELECT` only, read-only transactions and a 5 s statement timeout, and the API uses it.
+- **Status**: `/status` (and `/api/status`) shows when each stage last did its job: feed, stream, event
+  detection, map, model, names.
+- **Website** (`web/`): React + TypeScript, no UI framework, real URLs (History API), self-hosted fonts and a strict Content-Security-Policy (no third-party requests), shows
+  loading / empty / error states instead of fake zeros, light and dark themes.
+
+Tests: `make test` (Spark), and `cd api && pytest`, `cd analytics && pytest`
+(these start a throwaway PostgreSQL), `cd web && npm run build`. CI runs all of them.
 
 ## Design notes
 

@@ -1,0 +1,38 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  api-and-analytics:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sudo apt-get install -y postgresql postgresql-contrib
+      - run: pip install -r api/requirements.txt -r analytics/requirements.txt -r live/requirements.txt pytest httpx
+      - run: cd api && python -m pytest -q
+      - run: cd analytics && python -m pytest -q
+      - run: cd live && python -m pytest -q
+  spark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - run: pip install pyspark==3.5.3 pytest
+      - run: cd spark && LAKE_FORMAT=parquet POSTGRES_DB=x POSTGRES_USER=x POSTGRES_PASSWORD=x python -m pytest -q tests
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: cd web && npm ci && npm run build
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config -q
+      - run: docker compose -f docker-compose.yml -f docker-compose.prod.yml config -q

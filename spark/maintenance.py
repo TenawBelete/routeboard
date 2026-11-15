@@ -10,12 +10,13 @@
   3. Compaction: OPTIMIZE the tables (many small streaming files -> few large
      ones), then VACUUM to free the disk space of deleted files.
 
-Exit code is non-zero on any failure so the scheduler log shows it.
+Runs INSIDE the streaming job's JVM (see stream_job.start_maintenance_thread).
+Delta on S3 is only safe with a single writer process per table, so a second
+Spark application must never write to these tables.
 """
 
 import logging
 import os
-import sys
 from datetime import date, datetime, timedelta, timezone
 
 from delta.tables import DeltaTable
@@ -23,7 +24,13 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 import transforms as T
-from stream_job import BRONZE, EDGES_DAILY, SILVER, build_spark
+
+LAKE = os.environ.get("LAKE_PATH", "/data/lake")
+BRONZE = f"{LAKE}/bronze/ris_raw"
+SILVER = f"{LAKE}/silver/prefix_events"
+EDGES_DAILY = f"{LAKE}/gold/as_edges_daily"
+MAINTENANCE_HOUR_UTC = int(os.environ.get("MAINTENANCE_HOUR_UTC", "3"))
+MAINTENANCE_MINUTE_UTC = int(os.environ.get("MAINTENANCE_MINUTE_UTC", "15"))
 
 RETENTION_BRONZE_DAYS = int(os.environ.get("RETENTION_BRONZE_DAYS", "3"))
 RETENTION_SILVER_DAYS = int(os.environ.get("RETENTION_SILVER_DAYS", "14"))
@@ -31,8 +38,6 @@ RETENTION_SILVER_DAYS = int(os.environ.get("RETENTION_SILVER_DAYS", "14"))
 # them. 1 hour is plenty here: the only reader is our own streaming job.
 VACUUM_RETAIN_HOURS = int(os.environ.get("VACUUM_RETAIN_HOURS", "1"))
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout,
-                    format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("maintenance")
 
 
@@ -100,10 +105,14 @@ def compact(spark: SparkSession, path: str) -> None:
     log.info("%s: optimized and vacuumed (retain %dh)", path, VACUUM_RETAIN_HOURS)
 
 
-def main() -> int:
-    spark = build_spark("bgp-maintenance")
-    spark.sparkContext.setLogLevel("WARN")
-    today = datetime.now(timezone.utc).date()
+def next_run_after(now: datetime, hour: int, minute: int) -> datetime:
+    """The next daily run time strictly after `now` (UTC)."""
+    t = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return t if t > now else t + timedelta(days=1)
+
+
+def run(spark: SparkSession, today: date | None = None) -> None:
+    today = today or datetime.now(timezone.utc).date()
     log.info("maintenance start (today=%s, bronze keep=%dd, silver keep=%dd)",
              today, RETENTION_BRONZE_DAYS, RETENTION_SILVER_DAYS)
 
@@ -126,14 +135,4 @@ def main() -> int:
 
     for path in (BRONZE, SILVER, EDGES_DAILY):
         compact(spark, path)
-
     log.info("maintenance done")
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception:
-        log.exception("maintenance failed")
-        raise SystemExit(1)

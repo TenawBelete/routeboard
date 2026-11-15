@@ -1,5 +1,5 @@
-# BGP pipeline - stages 1-2b: broker, producer, object storage, Spark streaming job,
-# serving database, nightly maintenance.
+# BGP pipeline: broker, producer, object storage, Spark streaming job (which also
+# runs nightly maintenance in-process), serving database, API, analytics, website.
 # The same file runs on the laptop and on the server; only .env differs.
 # Every port is bound to 127.0.0.1, so nothing is reachable from outside
 # the machine. Public access is added later through a reverse proxy.
@@ -154,15 +154,21 @@ services:
       PGUSER: ${POSTGRES_USER}
       PGPASSWORD: ${POSTGRES_PASSWORD}
       PGDATABASE: ${POSTGRES_DB}
+      API_DB_PASSWORD: ${API_DB_PASSWORD:-}
     volumes:
       - ./postgres/init:/init:ro
     entrypoint: ["/bin/sh", "-c"]
-    command: ["for f in /init/*.sql; do psql -v ON_ERROR_STOP=1 -q -f \"$$f\" || exit 1; done"]
+    command:
+      - |
+        set -e
+        # The API's read-only login is created only when API_DB_PASSWORD is set.
+        if [ -n "$$API_DB_PASSWORD" ]; then set -- -v api_pw="$$API_DB_PASSWORD"; else set --; fi
+        for f in /init/*.sql; do psql -v ON_ERROR_STOP=1 -q "$$@" -f "$$f"; done
     restart: "no"
 
   # Spark Structured Streaming: Kafka -> Delta (bronze, silver) -> Postgres (gold).
   # The first start downloads connector jars (about 1-2 minutes), cached afterwards.
-  spark: &spark-base
+  spark:
     image: apache/spark:3.5.3-scala2.12-java17-python3-ubuntu
     user: root
     depends_on:
@@ -172,7 +178,7 @@ services:
         condition: service_completed_successfully
       s3-init:
         condition: service_completed_successfully
-    environment: &spark-env
+    environment:
       KAFKA_BOOTSTRAP: redpanda:9092
       KAFKA_TOPIC: ${KAFKA_TOPIC}
       POSTGRES_HOST: postgres
@@ -188,6 +194,8 @@ services:
       MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-50000}
       RETENTION_BRONZE_DAYS: ${RETENTION_BRONZE_DAYS:-3}
       RETENTION_SILVER_DAYS: ${RETENTION_SILVER_DAYS:-14}
+      MAINTENANCE_HOUR_UTC: ${MAINTENANCE_HOUR_UTC:-3}
+      MAINTENANCE_MINUTE_UTC: ${MAINTENANCE_MINUTE_UTC:-15}
     command:
       - /opt/spark/bin/spark-submit
       - --master=local[2]
@@ -203,43 +211,88 @@ services:
     mem_limit: ${SPARK_CONTAINER_MEMORY:-3g}
     restart: unless-stopped
 
-  # Nightly maintenance: deletes expired bronze/silver data, builds the daily
-  # AS-link summary, compacts the Delta tables. Runs once and exits; the
-  # scheduler container below starts it every night. Run by hand with:
-  #   docker compose run --rm maintenance
-  maintenance:
-    <<: *spark-base
-    profiles: ["ops"]
-    command:
-      - /opt/spark/bin/spark-submit
-      - --master=local[2]
-      - --driver-memory=${SPARK_DRIVER_MEMORY:-2g}
-      - --driver-java-options=-Duser.timezone=UTC
-      - --conf=spark.jars.ivy=/tmp/ivy
-      - --packages=${SPARK_PACKAGES}
-      - /app/maintenance.py
-    restart: "no"
-
-  # Tiny cron container that triggers `maintenance` on a schedule through the
-  # Docker socket. Schedule is in .env (MAINTENANCE_CRON, default 03:15 UTC).
-  scheduler:
-    image: docker:27-cli
+  # Read-only JSON API over the gold tables.
+  api:
+    build: ./api
     depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      API_DB_PASSWORD: ${API_DB_PASSWORD:-}   # set -> the API logs in as the read-only account bgp_api
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    ports:
+      - "127.0.0.1:8000:8000"
+    mem_limit: 384m
+    restart: unless-stopped
+
+  # Pushes route changes to browsers the moment they arrive (Server-Sent Events).
+  # A second, independent reader of the Kafka topic: no state, restart at any time.
+  live:
+    build: ./live
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      API_DB_PASSWORD: ${API_DB_PASSWORD:-}
+      LIVE_MAX_CLIENTS: ${LIVE_MAX_CLIENTS:-300}
+    mem_limit: 256m
+    restart: unless-stopped
+
+  # Hourly graph job (PageRank, hubs) and six-hourly risk model; results go to Postgres.
+  analytics:
+    build: ./analytics
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
       spark:
         condition: service_started
     environment:
-      MAINTENANCE_CRON: ${MAINTENANCE_CRON:-15 3 * * *}
-      COMPOSE_PROJECT_NAME: bgp-pipeline
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      S3_ENDPOINT: http://seaweedfs:8333
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      LAKE_PATH: s3a://lake
+      SPARK_PACKAGES: ${SPARK_PACKAGES}
+      GRAPH_EVERY_MINUTES: ${GRAPH_EVERY_MINUTES:-60}
+      MODEL_EVERY_MINUTES: ${MODEL_EVERY_MINUTES:-360}
+      FIRST_RUN_DELAY_MINUTES: ${FIRST_RUN_DELAY_MINUTES:-10}
+      GRAPH_WINDOW_HOURS: ${GRAPH_WINDOW_HOURS:-24}
+      ANALYTICS_DRIVER_MEMORY: ${ANALYTICS_DRIVER_MEMORY:-1500m}
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - .:/workspace:ro
-    working_dir: /workspace
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        echo "$$MAINTENANCE_CRON cd /workspace && docker compose --profile ops run --rm --no-deps maintenance >> /proc/1/fd/1 2>&1" > /etc/crontabs/root
-        echo "scheduler: maintenance at '$$MAINTENANCE_CRON' (UTC)"
-        exec crond -f -l 6
+      - ./spark:/app/spark:ro
+      - analytics-ivy:/tmp/ivy
+    mem_limit: ${ANALYTICS_CONTAINER_MEMORY:-2500m}
+    restart: unless-stopped
+
+  # The website. Locally: http://localhost:3000. In production see docker-compose.prod.yml.
+  web:
+    build: ./web
+    depends_on:
+      - api
+      - live
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - "127.0.0.1:3000:80"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    mem_limit: 128m
     restart: unless-stopped
 
   producer:
@@ -276,3 +329,6 @@ volumes:
   spark-checkpoints:  # streaming progress; must be reset together with the lake
   s3-config:
   spark-ivy:
+  analytics-ivy:
+  caddy-data:
+  caddy-config:

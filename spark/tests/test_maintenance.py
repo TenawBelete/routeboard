@@ -74,3 +74,11 @@ def test_expire_skips_missing_table(monkeypatch):
 
 def test_vacuum_retention_is_at_least_one_hour():
     assert M.VACUUM_RETAIN_HOURS >= 1
+
+
+def test_next_run_after():
+    from datetime import datetime, timezone
+    u = timezone.utc
+    assert M.next_run_after(datetime(2026, 11, 14, 2, 0, tzinfo=u), 3, 15) == datetime(2026, 11, 14, 3, 15, tzinfo=u)
+    assert M.next_run_after(datetime(2026, 11, 14, 3, 15, tzinfo=u), 3, 15) == datetime(2026, 11, 15, 3, 15, tzinfo=u)
+    assert M.next_run_after(datetime(2026, 11, 14, 23, 59, tzinfo=u), 3, 15) == datetime(2026, 11, 15, 3, 15, tzinfo=u)

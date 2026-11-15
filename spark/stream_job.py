@@ -19,6 +19,10 @@ deleted - so the checkpoint and the lake must always be deleted together
 import logging
 import os
 import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -42,6 +46,7 @@ PG_URL = f"jdbc:postgresql://{PG_HOST}:5432/{PG_DB}"
 BRONZE = f"{LAKE}/bronze/ris_raw"
 SILVER = f"{LAKE}/silver/prefix_events"
 EDGES_DAILY = f"{LAKE}/gold/as_edges_daily"      # built by maintenance.py
+TRIGGER_FILE = Path(os.environ.get("MAINTENANCE_TRIGGER", "/data/checkpoints/run-maintenance"))
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -184,6 +189,33 @@ def process_batch(batch: DataFrame, batch_id: int) -> None:
     raw.unpersist()
 
 
+def maintenance_loop(spark: SparkSession) -> None:
+    """Daily maintenance, plus on demand when TRIGGER_FILE appears (make maintenance).
+
+    Runs in a thread of THIS process: Delta on S3 allows one writer process per
+    table, and the streaming query is that writer.
+    """
+    import maintenance as M   # imported here: needs the delta package, not needed in unit tests
+    nxt = M.next_run_after(datetime.now(timezone.utc),
+                           M.MAINTENANCE_HOUR_UTC, M.MAINTENANCE_MINUTE_UTC)
+    log.info("maintenance scheduled for %s UTC daily; next %s", 
+             f"{M.MAINTENANCE_HOUR_UTC:02d}:{M.MAINTENANCE_MINUTE_UTC:02d}", nxt.isoformat())
+    while True:
+        time.sleep(5)
+        now = datetime.now(timezone.utc)
+        manual = TRIGGER_FILE.exists()
+        if manual or now >= nxt:
+            if manual:
+                TRIGGER_FILE.unlink(missing_ok=True)
+            try:
+                M.run(spark)
+            except Exception:   # never kill the stream because maintenance failed
+                log.exception("maintenance failed; will retry at the next scheduled time")
+            if now >= nxt:
+                nxt = M.next_run_after(datetime.now(timezone.utc),
+                                       M.MAINTENANCE_HOUR_UTC, M.MAINTENANCE_MINUTE_UTC)
+
+
 def main() -> None:
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
@@ -206,6 +238,8 @@ def main() -> None:
         .trigger(processingTime=f"{TRIGGER_SECONDS} seconds")
         .start()
     )
+    threading.Thread(target=maintenance_loop, args=(spark,), daemon=True,
+                     name="maintenance").start()
     query.awaitTermination()
 
 

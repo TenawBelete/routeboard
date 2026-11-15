@@ -1,0 +1,20 @@
+# Production overrides. Use together with the main file:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# Only the website is public (80/443). Every other port is closed, so the
+# database, broker, object store and API are reachable only inside Docker.
+# Set SITE_ADDRESS in .env to your domain (e.g. bgp.example.com): Caddy then gets
+# and renews the HTTPS certificate by itself.
+services:
+  web:
+    ports: !override
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+  api:
+    ports: !reset []
+  postgres:
+    ports: !reset []
+  redpanda:
+    ports: !reset []
+  seaweedfs:
+    ports: !reset []
