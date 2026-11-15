@@ -24,9 +24,9 @@ def pg():
     if os.geteuid() == 0:
         shutil.chown(d, "postgres"); shutil.chown(sock, "postgres"); su = ["runuser", "-u", "postgres", "--"]
     run = lambda c: subprocess.run(c, check=True, capture_output=True, text=True)
-    run(su + [str(PGBIN / "initdb"), "-D", str(d / "data"), "-A", "trust", "-E", "UTF8", "--locale=C"])
+    run(su + [str(PGBIN / "initdb"), "-D", str(d / "data"), "-U", "postgres", "-A", "trust", "-E", "UTF8", "--locale=C"])
     run(su + [str(PGBIN / "pg_ctl"), "-D", str(d / "data"), "-o", f"-p {PORT} -k {sock}", "-l", str(d / "log"), "start", "-w"])
-    psql = su + [str(PGBIN / "psql"), "-h", str(sock), "-p", PORT, "-v", "ON_ERROR_STOP=1", "-q"]
+    psql = su + [str(PGBIN / "psql"), "-h", str(sock), "-p", PORT, "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-q"]
     run(psql + ["-d", "postgres", "-c", "create database bgp"])
     for f in sorted((ROOT / "postgres/init").glob("*.sql")):
         run(psql + ["-d", "bgp", "-f", str(f)])
