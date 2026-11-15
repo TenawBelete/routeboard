@@ -29,10 +29,10 @@ def pg():
     if os.geteuid() == 0:                       # initdb refuses to run as root
         shutil.chown(d, "postgres"); shutil.chown(sock, "postgres")
         as_user = ["runuser", "-u", "postgres", "--"]
-    _run(as_user + [str(PGBIN / "initdb"), "-D", str(d / "data"), "-A", "trust", "-E", "UTF8", "--locale=C"])
+    _run(as_user + [str(PGBIN / "initdb"), "-D", str(d / "data"), "-U", "postgres", "-A", "trust", "-E", "UTF8", "--locale=C"])
     _run(as_user + [str(PGBIN / "pg_ctl"), "-D", str(d / "data"), "-o", f"-p {PORT} -k {sock}",
                     "-l", str(d / "log"), "start", "-w"])
-    psql = as_user + [str(PGBIN / "psql"), "-h", str(sock), "-p", PORT, "-v", "ON_ERROR_STOP=1", "-q"]
+    psql = as_user + [str(PGBIN / "psql"), "-h", str(sock), "-p", PORT, "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-q"]
     _run(psql + ["-d", "postgres", "-c", "create database bgp"])
     for f in sorted((ROOT / "postgres" / "init").glob("*.sql")):
         _run(psql + ["-d", "bgp", "-f", str(f)])
