@@ -13,6 +13,9 @@ HISTORY_SECONDS = 90     # ticks replayed to a browser when it connects
 FLUSHES_PER_SECOND = 4   # how often route paths are pushed for the map animations
 PATHS_PER_FLUSH = 30     # at most this many paths per push (120 a second) to each browser
 RECENT_PER_COUNTRY = 60  # last real route changes kept per country, replayed when a country is quiet
+FRESH_EVENTS = 800       # recent events kept for the polling fallback
+SNAPSHOT_WINDOW_S = 5    # a poll returns at most this many seconds of activity
+MSG_FIELDS = ("k", "n", "p", "o", "on", "oc", "path", "pc", "peer", "pn")
 
 
 def flatten_path(path) -> list[int]:
@@ -76,6 +79,9 @@ class Hub:
         self._paths: list[dict] = []
         self.recent: dict[str, deque] = defaultdict(lambda: deque(maxlen=RECENT_PER_COUNTRY))
         self.feed_up = False          # set by the Kafka reader; lets browsers say "reconnecting" instead of showing zeros
+        # Short memory for the polling fallback (see snapshot): every event and path gets a sequence number.
+        self._seq = 0
+        self._fresh: deque[dict] = deque(maxlen=FRESH_EVENTS)
 
     # -- producer side ---------------------------------------------------
     def add(self, events: list[dict]) -> None:
@@ -87,6 +93,8 @@ class Hub:
             else:
                 self._closed += e["n"]
             self._samples.append(e)
+            self._seq += 1
+            self._fresh.append({"s": self._seq, "t": self.clock(), "e": e})
             if e["k"] == "open" and len(e["path"]) >= 2:
                 self._paths.append(e)
                 item = {"t": int(self.clock()), "path": e["path"], "pc": e["pc"]}
@@ -110,6 +118,26 @@ class Hub:
         for cc, dq in self.recent.items():
             items = sorted(dq, key=lambda i: i["t"])[-RECENT_PER_COUNTRY:]
             dq.clear(); dq.extend(items)
+
+    def snapshot(self, country: str | None, after: int = 0, with_recent: bool = False) -> dict:
+        """What a polling browser needs for one second: ticks, route changes and messages newer than
+        `after`, filtered to the country. Used when the event stream is held back by a proxy."""
+        now = self.clock()
+        items = [i for i in self._fresh if i["s"] > after and now - i["t"] < SNAPSHOT_WINDOW_S]
+        mine = [i for i in items if matches(i["e"], country)]
+        paths = [{"s": i["s"], "path": i["e"]["path"], "pc": i["e"]["pc"]}
+                 for i in mine if i["e"]["k"] == "open" and len(i["e"]["path"]) >= 2][-PATHS_PER_FLUSH:]
+        msgs = [{"s": i["s"], **{k: v for k, v in i["e"].items() if k in MSG_FIELDS}} for i in mine][-SAMPLES_PER_SECOND * 2:]
+        out = {
+            "seq": self._seq,
+            "up": self.feed_up,
+            "ticks": [t for t in self.history if now - t["t"] < SNAPSHOT_WINDOW_S],
+            "paths": paths,
+            "msgs": msgs,
+        }
+        if with_recent and country:
+            out["recent"] = list(self.recent[country])
+        return out
 
     def tick(self) -> dict:
         """Call once per second: publish the second that just ended."""

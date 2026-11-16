@@ -132,3 +132,21 @@ def test_remember_fills_memory_without_counting():
     h.sort_recent()
     assert [i["t"] for i in h.recent["ER"]] == [700, 900]   # oldest first after warm-up
     assert "DE" in h.recent and "US" in h.recent
+
+
+def test_snapshot_returns_only_new_items_for_the_country():
+    now = [1000]
+    h = Hub(clock=lambda: now[0])
+    fr = [{"k": "open", "n": 1, "p": "p", "o": 3, "on": None, "oc": "FR", "path": [1, 2, 3], "pc": ["US", "DE", "FR"], "peer": 1}]
+    us = [{"k": "open", "n": 1, "p": "q", "o": 9, "on": None, "oc": "US", "path": [4, 9], "pc": ["JP", "US"], "peer": 4}]
+    h.add(fr); h.add(us)
+    h.tick()
+    first = h.snapshot("FR", after=0)
+    assert [p["path"] for p in first["paths"]] == [[1, 2, 3]]
+    assert first["seq"] == 2 and first["ticks"]
+    assert h.snapshot("FR", after=first["seq"])["paths"] == []        # nothing new since
+    now[0] += 10                                                      # older than the window: gone
+    assert h.snapshot(None, after=0)["paths"] == [] and h.snapshot(None, after=0)["ticks"] == []
+    h.add(fr); h.remember([], 0)
+    assert h.snapshot("FR", after=0)["seq"] == 3
+    assert "recent" in h.snapshot("FR", after=0, with_recent=True)

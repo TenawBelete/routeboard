@@ -197,6 +197,18 @@ async def stream(request: Request, country: str | None):
                              headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 
+@app.get("/live/snapshot")
+def live_snapshot(country: str | None = Query(None, min_length=2, max_length=2),
+                  after: int = Query(0, ge=0), recent: bool = False):
+    """The same live data as /live/stream, as one short plain response. Browsers poll this once a second
+    when a proxy holds the event stream back; a plain response is never held."""
+    if country is not None:
+        country = country.upper()
+        if not re.fullmatch(r"[A-Z]{2}", country):
+            raise HTTPException(422, "country must be a two-letter code")
+    return hub.snapshot(country, after=after, with_recent=recent)
+
+
 @app.get("/live/stream")
 async def live_stream(request: Request, country: str | None = Query(None, min_length=2, max_length=2)):
     if country is not None:
