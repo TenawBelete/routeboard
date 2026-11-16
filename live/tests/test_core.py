@@ -118,3 +118,17 @@ def test_recent_changes_are_kept_per_country_for_replay():
     assert len(hub.recent["ER"]) == RECENT_PER_COUNTRY and len(hub.recent["SE"]) == RECENT_PER_COUNTRY
     assert hub.recent["ER"][-1] == {"t": 500, "path": [3333, 1299, 30987], "pc": ["NL", "SE", "ER"]}
     assert "US" not in hub.recent
+
+
+def test_remember_fills_memory_without_counting():
+    h = Hub(clock=lambda: 1000)
+    ev = [{"k": "open", "n": 1, "p": "1.0.0.0/24", "o": 3, "on": None, "oc": "ER",
+           "path": [1, 2, 3], "pc": ["US", "DE", "ER"], "peer": 1}]
+    h.remember(ev, 900)
+    h.remember(ev, 700)
+    t = h.tick()
+    assert t["opened"] == 0 and t["messages"] == 0          # counters untouched
+    assert [i["t"] for i in h.recent["ER"]] == [900, 700]
+    h.sort_recent()
+    assert [i["t"] for i in h.recent["ER"]] == [700, 900]   # oldest first after warm-up
+    assert "DE" in h.recent and "US" in h.recent

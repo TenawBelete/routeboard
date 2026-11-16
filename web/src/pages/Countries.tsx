@@ -133,15 +133,20 @@ export default function Countries({ cc }: { cc: string | null }) {
     let lastLive = 0, i = 0;
     const onRoute = (ev: Event) => { const d = (ev as CustomEvent<RoutePath>).detail; if (d.scope === cc && !d.replay) lastLive = Date.now(); };
     window.addEventListener("routeboard:route", onRoute);
+    const replayOne = () => {
+      if (!recent.length || document.hidden) return;
+      const r = recent[recent.length - 1 - (i++ % recent.length)];
+      window.dispatchEvent(new CustomEvent<RoutePath>("routeboard:route", { detail: { path: r.path, pc: r.pc, scope: cc, replay: true } }));
+    };
+    // The moment the country's memory arrives, start moving: a few quick ones, then a steady pace.
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    if (recent.length) { setMode("replay"); [0, 200, 450, 750].forEach((ms) => timers.push(setTimeout(replayOne, ms))); }
     const id = setInterval(() => {
       const quiet = Date.now() - lastLive > 6000;
       setMode(!quiet ? "live" : recent.length ? "replay" : "waiting");
-      if (quiet && recent.length && !document.hidden) {
-        const r = recent[recent.length - 1 - (i++ % recent.length)];
-        window.dispatchEvent(new CustomEvent<RoutePath>("routeboard:route", { detail: { path: r.path, pc: r.pc, scope: cc, replay: true } }));
-      }
+      if (quiet) replayOne();
     }, 700);
-    return () => { clearInterval(id); window.removeEventListener("routeboard:route", onRoute); };
+    return () => { clearInterval(id); timers.forEach(clearTimeout); window.removeEventListener("routeboard:route", onRoute); };
   }, [cc, recent]);
   const newest = recent.length ? new Date(recent[recent.length - 1].t * 1000).toISOString().slice(11, 16) : null;
 

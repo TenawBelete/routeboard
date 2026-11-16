@@ -93,6 +93,24 @@ class Hub:
                 for cc in {c for c in e["pc"] if c}:
                     self.recent[cc].append(item)
 
+    def remember(self, events: list[dict], t: int) -> None:
+        """Keep a past route change in the per-country memory without touching any counter.
+
+        Used at start-up to warm the memory from what Kafka still holds, so a quiet country
+        has real, time-stamped changes to show right away instead of waiting for the next one.
+        """
+        for e in events:
+            if e["k"] == "open" and len(e["path"]) >= 2:
+                item = {"t": int(t), "path": e["path"], "pc": e["pc"]}
+                for cc in {c for c in e["pc"] if c}:
+                    self.recent[cc].append(item)
+
+    def sort_recent(self) -> None:
+        """Oldest first in every country's memory (warm-up and live arrivals may interleave)."""
+        for cc, dq in self.recent.items():
+            items = sorted(dq, key=lambda i: i["t"])[-RECENT_PER_COUNTRY:]
+            dq.clear(); dq.extend(items)
+
     def tick(self) -> dict:
         """Call once per second: publish the second that just ended."""
         t = {"t": int(self.clock()), "opened": self._opened, "closed": self._closed, "messages": self._messages, "up": self.feed_up}

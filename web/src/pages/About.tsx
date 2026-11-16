@@ -37,7 +37,7 @@ export default function About() {
               <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#101820" /></marker></defs>
               {BOX(4, 20, 156, "RIPE live feed", "public route messages", true)}
               {BOX(200, 20, 150, "Collector", "Python, keeps 1 in 50")}
-              {BOX(390, 20, 150, "Queue", "Redpanda, holds 6 hours")}
+              {BOX(390, 20, 150, "Kafka queue", "Redpanda, holds 6 hours")}
               {BOX(580, 20, 170, "Stream processor", "Spark, every 30 seconds")}
               {BOX(800, 20, 276, "Long-term storage", "Delta Lake: raw 3 days, clean 14 days")}
               {BOX(580, 210, 170, "Database", "Postgres, ready answers")}

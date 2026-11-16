@@ -13,6 +13,7 @@ main pipeline and holds no state: restart it at any time.
 import asyncio
 import logging
 import os
+import time
 import re
 import sys
 from contextlib import asynccontextmanager
@@ -86,6 +87,61 @@ async def kafka_loop() -> None:
                 pass
 
 
+BACKFILL_MAX_SECONDS = int(os.environ.get("LIVE_BACKFILL_MAX_SECONDS", "600"))
+
+
+async def backfill_loop() -> None:
+    """Once, at start-up: read what Kafka still holds (up to the topic's retention, 6 h by default)
+    and remember the last real route changes per country. Counters are not touched, so the
+    live numbers stay about now; only the per-country replay memory gets a past."""
+    from aiokafka import AIOKafkaConsumer, TopicPartition
+    for _ in range(60):                                   # names give paths their countries; wait for them briefly
+        if state["names"]:
+            break
+        await asyncio.sleep(1)
+    state["backfill"] = {"status": "running"}
+    consumer = AIOKafkaConsumer(bootstrap_servers=KAFKA_BOOTSTRAP, group_id=None,
+                                auto_offset_reset="earliest", enable_auto_commit=False, max_poll_records=2000)
+    started = time.time(); n = 0
+    try:
+        await consumer.start()
+        parts = [TopicPartition(KAFKA_TOPIC, p) for p in sorted(consumer.partitions_for_topic(KAFKA_TOPIC) or [])]
+        if not parts:
+            raise RuntimeError("topic has no partitions yet")
+        consumer.assign(parts)
+        end = await consumer.end_offsets(parts)
+        await consumer.seek_to_beginning(*parts)
+        done = {tp: (await consumer.position(tp)) >= end[tp] for tp in parts}
+        while not all(done.values()) and time.time() - started < BACKFILL_MAX_SECONDS:
+            batch = await consumer.getmany(timeout_ms=2000, max_records=2000)
+            if not batch:
+                continue
+            for tp, msgs in batch.items():
+                for m in msgs:
+                    try:
+                        hub.remember(to_events(m.value, names), m.timestamp // 1000)
+                    except Exception:
+                        pass
+                n += len(msgs)
+                if msgs and msgs[-1].offset + 1 >= end[tp]:
+                    done[tp] = True
+            await asyncio.sleep(0)                        # let ticks and browsers run between batches
+        hub.sort_recent()
+        state["backfill"] = {"status": "done", "messages": n, "seconds": round(time.time() - started),
+                             "countries": len(hub.recent)}
+        log.info("backfill: %d messages in %ds, memory for %d countries", n, time.time() - started, len(hub.recent))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        state["backfill"] = {"status": "skipped", "error": f"{type(exc).__name__}: {exc}"[:200]}
+        log.warning("backfill skipped (%s: %s); the memory fills from live messages instead", type(exc).__name__, exc)
+    finally:
+        try:
+            await consumer.stop()
+        except Exception:
+            pass
+
+
 async def tick_loop() -> None:
     n = 0
     while True:
@@ -98,7 +154,7 @@ async def tick_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    tasks = [asyncio.create_task(c()) for c in (names_loop, kafka_loop, tick_loop)]
+    tasks = [asyncio.create_task(c()) for c in (names_loop, kafka_loop, tick_loop, backfill_loop)]
     yield
     for t in tasks:
         t.cancel()
@@ -112,7 +168,8 @@ def health():
     from aiokafka.codec import has_lz4
     return {"status": "ok" if state["kafka"] == "connected" else "degraded", "kafka": state["kafka"],
             "clients": len(hub.clients), "names": state["names"], "messages": hub.total_messages,
-            "bad_messages": state["bad_messages"], "last_error": state["last_error"], "lz4": has_lz4()}
+            "bad_messages": state["bad_messages"], "last_error": state["last_error"], "lz4": has_lz4(),
+            "backfill": state.get("backfill")}
 
 
 async def stream(request: Request, country: str | None):
