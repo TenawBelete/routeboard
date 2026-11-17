@@ -70,7 +70,8 @@ def pg():
 @pytest.fixture(scope="session")
 def client(pg):
     os.environ.update(POSTGRES_HOST=pg["host"], POSTGRES_PORT=pg["port"], POSTGRES_DB="bgp",
-                      POSTGRES_USER="postgres", POSTGRES_PASSWORD="x")
+                      POSTGRES_USER="postgres", POSTGRES_PASSWORD="x",
+                      OFFLINE_KEY="test-offline-key", SITE_URL="https://routeboard.example")
     sys.path.insert(0, str(ROOT / "api"))
     from fastapi.testclient import TestClient
     from app.main import app

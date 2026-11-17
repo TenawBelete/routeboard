@@ -16,7 +16,7 @@ export function Pulse({ live, dark = false }: { live: LiveState; dark?: boolean 
     <div className="pulse">
       <div className="pulse-now" aria-live="off">
         <b>{now ? fmt(now.opened + now.closed) : "–"}</b>
-        <span>routes changed in the last second<br />{now ? `${fmt(now.opened)} opened, ${fmt(now.closed)} closed` : " "}</span>
+        <span>routes changed in one second<br />{now ? `${fmt(now.opened)} opened, ${fmt(now.closed)} closed` : " "}</span>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="chart" role="img" aria-label="Route changes per second over the last minute" preserveAspectRatio="none">
         {ticks.map((t, i) => {
@@ -29,7 +29,7 @@ export function Pulse({ live, dark = false }: { live: LiveState; dark?: boolean 
           );
         })}
       </svg>
-      <div className="pulse-axis"><span>60 seconds ago</span><span>now</span></div>
+      <div className="pulse-axis"><span>60 seconds earlier</span><span>latest</span></div>
     </div>
   );
 }
@@ -48,10 +48,11 @@ function sentence(m: LiveMsg) {
  */
 export function Wire({ live, empty, rows = 10 }: { live: LiveState; empty?: string; rows?: number }) {
   const down = live.status === "down" || !live.feedUp;
-  const msgs = down ? [] : live.msgs.slice(0, rows);
+  const paused = live.status === "replay";
+  const msgs = down || paused ? [] : live.msgs.slice(0, rows);
   return (
     <ol className="wire" aria-live="off" style={{ height: rows * 40 }}>
-      {msgs.length === 0 && <li className="idle">{down ? "The live stream is not reachable right now." : empty ?? "Waiting for the next route change…"}</li>}
+      {msgs.length === 0 && <li className="idle">{paused ? empty ?? "Waiting for the next route change…" : down ? "The live stream is not reachable right now." : empty ?? "Waiting for the next route change…"}</li>}
       {msgs.map((m) => <li key={m.id}>{sentence(m)}</li>)}
     </ol>
   );

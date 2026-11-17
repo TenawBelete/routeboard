@@ -121,7 +121,7 @@ def test_events_list_detail_and_feed(client):
     assert client.get("/api/events/999999").status_code == 404
     feed = client.get("/api/events.atom", headers={"host": "bgp.example.com", "x-forwarded-proto": "https"})
     assert feed.headers["content-type"].startswith("application/xml") and "/feed.xsl" in feed.text
-    assert f"https://bgp.example.com/event/{week[0]['id']}" in feed.text and "<feed" in feed.text
+    assert f"https://routeboard.example/event/{week[0]['id']}" in feed.text and "<feed" in feed.text   # SITE_URL, not the Host header
     import xml.etree.ElementTree as ET
     ET.fromstring(feed.text)                                            # well-formed XML
 
@@ -162,3 +162,33 @@ def test_countries_list(client):
     items = client.get("/api/countries").json()["items"]
     by = {i["country"]: i for i in items}
     assert by["ER"]["networks"] == 2 and by["ER"]["changes_last_hour"] == 6 and by["US"]["networks"] == 3
+
+
+def test_offline_bundle_needs_the_key_and_holds_the_pages_data(client):
+    assert client.get("/api/offline-bundle").status_code == 404
+    assert client.get("/api/offline-bundle", headers={"X-Offline-Key": "wrong"}).status_code == 404
+    r = client.get("/api/offline-bundle", headers={"X-Offline-Key": "test-offline-key"})
+    assert r.status_code == 200
+    assert r.headers["cache-control"] == "no-store"
+    b = r.json()
+    assert b["saved_at"] > 0
+    assert "/api/briefing" in b["api"] and "/api/countries" in b["api"]
+    assert "/api/status" not in b["api"]            # the status page must always tell the truth
+    assert not any(k.startswith("/api/search") for k in b["api"])
+
+
+def test_cached_answers_keep_cors_headers(client):
+    h = {"Origin": "https://routeboard.example"}
+    a = client.get("/api/countries", headers=h)
+    b = client.get("/api/countries", headers=h)        # second one comes from the cache
+    assert a.status_code == b.status_code == 200
+    assert a.json() == b.json()
+    assert b.headers.get("access-control-allow-origin") in ("*", "https://routeboard.example")
+    assert "max-age" in b.headers.get("cache-control", "")
+
+
+def test_feed_links_use_the_configured_site_address(client):
+    r = client.get("/api/events.atom", headers={"Host": "evil.example", "X-Forwarded-Host": "evil.example"})
+    assert r.status_code == 200
+    assert "https://routeboard.example/" in r.text
+    assert "evil.example" not in r.text

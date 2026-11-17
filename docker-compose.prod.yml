@@ -12,6 +12,8 @@ services:
       - "443:443/udp"
   api:
     ports: !reset []
+    environment:
+      API_DOCS: "false"
   postgres:
     ports: !reset []
   redpanda:

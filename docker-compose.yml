@@ -213,6 +213,8 @@ services:
 
   # Read-only JSON API over the gold tables.
   api:
+    security_opt: ["no-new-privileges:true"]   # security review item 8
+    cap_drop: [ALL]
     build: ./api
     depends_on:
       db-migrate:
@@ -224,6 +226,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       API_DB_PASSWORD: ${API_DB_PASSWORD:-}   # set -> the API logs in as the read-only account bgp_api
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      API_DOCS: ${API_DOCS:-true}         # false when the site is public
+      SITE_URL: ${SITE_URL:-}             # e.g. https://butenai.com (feed links)
+      OFFLINE_KEY: ${OFFLINE_KEY:-}       # shared with the Cloudflare offline Worker
     ports:
       - "127.0.0.1:8000:8000"
     mem_limit: 384m
@@ -232,6 +237,8 @@ services:
   # Pushes route changes to browsers the moment they arrive (Server-Sent Events).
   # A second, independent reader of the Kafka topic: no state, restart at any time.
   live:
+    security_opt: ["no-new-privileges:true"]   # security review item 8
+    cap_drop: [ALL]
     build: ./live
     depends_on:
       redpanda-init:
@@ -247,6 +254,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       API_DB_PASSWORD: ${API_DB_PASSWORD:-}
       LIVE_MAX_CLIENTS: ${LIVE_MAX_CLIENTS:-300}
+      LIVE_MAX_PER_IP: ${LIVE_MAX_PER_IP:-4}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      OFFLINE_KEY: ${OFFLINE_KEY:-}
     mem_limit: 256m
     restart: unless-stopped
 
@@ -281,6 +291,7 @@ services:
 
   # The website. Locally: http://localhost:3000. In production see docker-compose.prod.yml.
   web:
+    security_opt: ["no-new-privileges:true"]
     build: ./web
     depends_on:
       - api
@@ -296,6 +307,8 @@ services:
     restart: unless-stopped
 
   producer:
+    security_opt: ["no-new-privileges:true"]   # security review item 8
+    cap_drop: [ALL]
     build: ./producer
     depends_on:
       redpanda-init:

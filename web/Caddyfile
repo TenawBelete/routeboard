@@ -28,7 +28,7 @@
 		Referrer-Policy strict-origin-when-cross-origin
 		X-Frame-Options DENY
 		Permissions-Policy "geolocation=(), camera=(), microphone=()"
-		Strict-Transport-Security "max-age=31536000"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		-Server
 	}
 	# The API's own documentation page loads its viewer from a CDN, so the strict policy covers the site only.

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { apiUrl } from "../config";
 import { EventRow, usePoll } from "../api";
 import { Async, Seg } from "../components/ui";
 
@@ -31,7 +32,7 @@ export default function Events() {
         <div className="wrap">
           <h1>Events</h1>
           <p className="lead">Every time the routing system does something out of the ordinary, it is recorded here: a sudden burst of closed routes, or one network changing far more than its usual. Each event has its own page you can share.</p>
-          <p className="note" style={{ marginTop: 14 }}>Follow along in a feed reader: <a href="/api/events.atom">events feed</a>.</p>
+          <p className="note" style={{ marginTop: 14 }}>Follow along in a feed reader: <a href={apiUrl("/api/events.atom")}>events feed</a>.</p>
         </div>
       </div>
       <div className="band">

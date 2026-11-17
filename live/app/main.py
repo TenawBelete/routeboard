@@ -18,8 +18,11 @@ import re
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+import hmac
+
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .core import FLUSHES_PER_SECOND, Hub, sse, to_events
 
@@ -33,6 +36,14 @@ NAMES_REFRESH_SECONDS = 3600
 hub = Hub(max_clients=int(os.environ.get("LIVE_MAX_CLIENTS", "300")))
 names: dict[int, tuple[str | None, str | None]] = {}
 state = {"kafka": "starting", "names": 0, "last_error": None, "bad_messages": 0}
+MAX_PER_IP = int(os.environ.get("LIVE_MAX_PER_IP", "4"))   # one visitor cannot take every stream slot
+OFFLINE_KEY = os.environ.get("OFFLINE_KEY", "")             # shared with the Cloudflare Worker; empty = replay disabled
+per_ip: dict[str, int] = {}
+
+
+def client_ip(request: Request) -> str:
+    # Behind the Cloudflare tunnel every request carries the visitor's address in this header.
+    return request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "?")
 
 
 def _load_names() -> dict:
@@ -77,7 +88,7 @@ async def kafka_loop() -> None:
             raise
         except Exception as exc:
             state["kafka"] = "reconnecting"; hub.feed_up = False
-            state["last_error"] = f"{type(exc).__name__}: {exc}"[:300]      # shown by /live/health so the cause is visible without the logs
+            state["last_error"] = type(exc).__name__   # class only in /live/health; the full text (with internal host names) goes to the log
             log.warning("kafka error (%s: %s); reconnecting in 5s", type(exc).__name__, exc)
             await asyncio.sleep(5)
         finally:
@@ -133,7 +144,7 @@ async def backfill_loop() -> None:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        state["backfill"] = {"status": "skipped", "error": f"{type(exc).__name__}: {exc}"[:200]}
+        state["backfill"] = {"status": "skipped", "error": type(exc).__name__}
         log.warning("backfill skipped (%s: %s); the memory fills from live messages instead", type(exc).__name__, exc)
     finally:
         try:
@@ -161,6 +172,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Routeboard live stream", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",")],
+                   allow_methods=["GET"], allow_headers=["*"])
 
 
 @app.get("/live/health")
@@ -173,9 +186,13 @@ def health():
 
 
 async def stream(request: Request, country: str | None):
+    ip = client_ip(request)
+    if per_ip.get(ip, 0) >= MAX_PER_IP:
+        raise HTTPException(429, "too many open live views from this address")
     q = hub.connect(country)
     if q is None:
         raise HTTPException(503, "too many viewers right now; try again shortly")
+    per_ip[ip] = per_ip.get(ip, 0) + 1
 
     async def body():
         try:
@@ -192,6 +209,11 @@ async def stream(request: Request, country: str | None):
                     break
         finally:
             hub.disconnect(q)
+            left = per_ip.get(ip, 1) - 1
+            if left > 0:
+                per_ip[ip] = left
+            else:
+                per_ip.pop(ip, None)
 
     return StreamingResponse(body(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
@@ -207,6 +229,15 @@ def live_snapshot(country: str | None = Query(None, min_length=2, max_length=2),
         if not re.fullmatch(r"[A-Z]{2}", country):
             raise HTTPException(422, "country must be a two-letter code")
     return hub.snapshot(country, after=after, with_recent=recent)
+
+
+@app.get("/live/replay")
+def live_replay(x_offline_key: str = Header("")):
+    """The last 10 minutes, for the Cloudflare Worker that keeps the site useful when this server stops.
+    Not public: it needs the shared key, so it cannot be used to load the server."""
+    if not OFFLINE_KEY or not hmac.compare_digest(x_offline_key, OFFLINE_KEY):
+        raise HTTPException(404, "not found")
+    return JSONResponse(hub.replay(), headers={"Cache-Control": "no-store"})   # never cached anywhere
 
 
 @app.get("/live/stream")

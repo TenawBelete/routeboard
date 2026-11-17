@@ -32,8 +32,26 @@ make health
 Open https://bgp.yourdomain.com. The certificate is issued automatically (needs
 ports 80 and 443 reachable and the DNS record from step 2).
 
-## 5. Firewall and updates
-Hetzner Cloud Firewall: allow inbound TCP 22 (ideally only your IP), 80, 443; deny the rest.
+## 5. Firewall, SSH and updates
+**Best: no open web ports at all.** Run `cloudflared` on the server exactly as on the Mac
+(docs/DEPLOY_CLOUDFLARE.md). The tunnel connects outwards, so the Hetzner Cloud Firewall only needs
+inbound TCP 22 from your own IP, and nobody can reach the site without passing Cloudflare's rules.
+
+**If you serve 80/443 directly instead**, allow them only from Cloudflare's address ranges
+(https://www.cloudflare.com/ips/), not from everyone. Otherwise anyone who finds the server's IP can
+skip the WAF and rate limits (security review, item 2). Caddy then needs a certificate that works
+behind Cloudflare: a Cloudflare Origin Certificate, or the Cloudflare DNS challenge.
+
+SSH: create a normal user and stop logging in as root.
+```bash
+adduser deploy && usermod -aG sudo,docker deploy
+mkdir -p /home/deploy/.ssh && cp ~/.ssh/authorized_keys /home/deploy/.ssh/ && chown -R deploy: /home/deploy/.ssh
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/; s/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+systemctl restart ssh
+apt-get install -y fail2ban unattended-upgrades
+```
+From then on: `ssh deploy@SERVER_IP`. Test the new login in a second window before closing the first.
+
 Updating later: `git pull && make prod-up`.
 
 ## Backups (optional)

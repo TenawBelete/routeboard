@@ -10,6 +10,8 @@ from collections import defaultdict, deque
 MAX_PATH = 8             # networks kept per path in an event sent to the browser
 SAMPLES_PER_SECOND = 6   # individual route changes shown per second (the counters cover the rest)
 HISTORY_SECONDS = 90     # ticks replayed to a browser when it connects
+REPLAY_SECONDS = 600     # offline mode: the last 10 minutes are saved to Cloudflare and replayed if the server stops
+REPLAY_PATHS_PER_SECOND = 8  # route changes kept per second for that replay (bounds its size to ~0.5 MB)
 FLUSHES_PER_SECOND = 4   # how often route paths are pushed for the map animations
 PATHS_PER_FLUSH = 30     # at most this many paths per push (120 a second) to each browser
 RECENT_PER_COUNTRY = 60  # last real route changes kept per country, replayed when a country is quiet
@@ -82,6 +84,11 @@ class Hub:
         # Short memory for the polling fallback (see snapshot): every event and path gets a sequence number.
         self._seq = 0
         self._fresh: deque[dict] = deque(maxlen=FRESH_EVENTS)
+        # Offline mode: a rolling 10-minute record of ticks and real route changes (see replay()).
+        self.long_history: deque[dict] = deque(maxlen=REPLAY_SECONDS)
+        self._replay: deque[dict] = deque(maxlen=REPLAY_SECONDS * REPLAY_PATHS_PER_SECOND)
+        self._replay_sec = 0
+        self._replay_n = 0
 
     # -- producer side ---------------------------------------------------
     def add(self, events: list[dict]) -> None:
@@ -97,6 +104,13 @@ class Hub:
             self._fresh.append({"s": self._seq, "t": self.clock(), "e": e})
             if e["k"] == "open" and len(e["path"]) >= 2:
                 self._paths.append(e)
+                now = self.clock()
+                sec = int(now)
+                if sec != self._replay_sec:
+                    self._replay_sec, self._replay_n = sec, 0
+                if self._replay_n < REPLAY_PATHS_PER_SECOND:
+                    self._replay_n += 1
+                    self._replay.append({"t": round(now, 2), "path": e["path"], "pc": e["pc"]})
                 item = {"t": int(self.clock()), "path": e["path"], "pc": e["pc"]}
                 for cc in {c for c in e["pc"] if c}:
                     self.recent[cc].append(item)
@@ -139,12 +153,28 @@ class Hub:
             out["recent"] = list(self.recent[country])
         return out
 
+    def replay(self) -> dict:
+        """The last REPLAY_SECONDS of real activity, for offline mode.
+
+        A Cloudflare Worker saves this every two minutes. If the server stops, browsers play it back,
+        clearly labelled as a replay, instead of showing an error page. Nothing in it is invented:
+        every tick and route change was observed, with its original time."""
+        now = self.clock()
+        return {
+            "saved_at": int(now),
+            "seconds": REPLAY_SECONDS,
+            "ticks": [t for t in self.long_history if now - t["t"] <= REPLAY_SECONDS],
+            "paths": [p for p in self._replay if now - p["t"] <= REPLAY_SECONDS],
+            "recent": {cc: list(dq) for cc, dq in self.recent.items() if dq},
+        }
+
     def tick(self) -> dict:
         """Call once per second: publish the second that just ended."""
         t = {"t": int(self.clock()), "opened": self._opened, "closed": self._closed, "messages": self._messages, "up": self.feed_up}
         samples, self._samples = self._samples, []
         self._opened = self._closed = self._messages = 0
         self.history.append(t)
+        self.long_history.append(t)
         for q, country in list(self.clients.items()):
             mine = [e for e in samples if matches(e, country)]
             # Spread the few we show across the second's messages rather than taking the first ones.

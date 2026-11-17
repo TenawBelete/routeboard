@@ -2,6 +2,8 @@ import { useEffect } from "react";
 import { Health, usePoll } from "./api";
 import { usePath } from "./nav";
 import { useLive } from "./live";
+import { useOffline } from "./offline";
+import { navigate } from "./nav";
 import { Contact } from "./components/Contact";
 import Home from "./pages/Home";
 import Live from "./pages/Live";
@@ -51,6 +53,7 @@ export default function App() {
   const path = usePath();
   const health = usePoll<Health>("/health", 20000);
   const live = useLive();
+  const saved = useOffline();
   const r = route(path);
   useEffect(() => { document.title = r.title ? `${r.title} | Routeboard` : "Routeboard: the internet's live departures board"; }, [r.title]);
 
@@ -59,6 +62,9 @@ export default function App() {
   if (health.kind === "ok") { tone = health.data.status === "ok" ? "ok" : "warn"; why = health.data.status === "ok" ? "Everything is working" : "Data is delayed"; }
   else if (health.kind === "error") { tone = "bad"; why = "The site cannot reach its data"; }
   if (tone === "ok" && (live.status === "down" || !live.feedUp)) { tone = "warn"; why = "The live stream is down"; }
+  // While the server is away (saved data is showing), the status light, link and page are hidden.
+  const offline = saved !== null;
+  useEffect(() => { if (offline && path === "/status") { history.replaceState(null, "", "/"); navigate("/"); } }, [offline, path]);
 
   return (
     <>
@@ -69,13 +75,13 @@ export default function App() {
           <nav aria-label="Pages">
             {NAV.map((n) => <a key={n.path} href={n.path} className={n.path === r.section ? "active" : ""} aria-current={n.path === r.section ? "page" : undefined}>{n.label}</a>)}
           </nav>
-          <a className={`status ${tone}`} href="/status" title={why} aria-label={`System status: ${why}`}><i /><span>System status</span></a>
+          {!offline && <a className={`status ${tone}`} href="/status" title={why} aria-label={`System status: ${why}`}><i /><span>System status</span></a>}
         </div>
       </header>
       <main id="main">{r.el}</main>
       <footer><div className="wrap">
         <span>Source: <a href="https://ris.ripe.net/" target="_blank" rel="noreferrer noopener">RIPE RIS Live</a>, a public feed of internet routing messages. We read 1 message in 50, so counts are a sample.</span>
-        <span><a href="/status">System status</a> <a href="/api/docs" target="_blank" rel="noreferrer">Open data API</a> <a href="/about">How it works</a></span>
+        <span>{!offline && <a href="/status">System status</a>} <a href="https://github.com/TenawBelete/routeboard" target="_blank" rel="noreferrer noopener">Source code</a> <a href="/about">How it works</a></span>
         <span>Built by Tenaw Belete. <Contact compact /></span>
       </div></footer>
     </>

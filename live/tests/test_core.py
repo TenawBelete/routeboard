@@ -150,3 +150,20 @@ def test_snapshot_returns_only_new_items_for_the_country():
     h.add(fr); h.remember([], 0)
     assert h.snapshot("FR", after=0)["seq"] == 3
     assert "recent" in h.snapshot("FR", after=0, with_recent=True)
+
+
+def test_replay_keeps_ten_minutes_and_caps_paths_per_second():
+    from app.core import REPLAY_PATHS_PER_SECOND, REPLAY_SECONDS
+    now = [1000.0]
+    h = Hub(clock=lambda: now[0])
+    ev = [{"k": "open", "n": 1, "p": "p", "o": 3, "on": None, "oc": "ET", "path": [1, 2, 3], "pc": ["US", "DE", "ET"], "peer": 1}]
+    for _ in range(REPLAY_PATHS_PER_SECOND + 5):      # more than the cap within one second
+        h.add(ev)
+    h.tick()
+    r = h.replay()
+    assert len(r["paths"]) == REPLAY_PATHS_PER_SECOND
+    assert r["ticks"][0]["opened"] == REPLAY_PATHS_PER_SECOND + 5   # counters are not capped, only the saved paths
+    assert "ET" in r["recent"]
+    now[0] += REPLAY_SECONDS + 5                       # everything is older than 10 minutes now
+    r = h.replay()
+    assert r["paths"] == [] and r["ticks"] == []

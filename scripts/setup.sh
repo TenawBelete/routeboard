@@ -8,12 +8,16 @@ rand() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32; }
 
 if [ -f .env ]; then
   # Existing install: keep everything, only add settings introduced by newer versions.
+  added=0
   if ! grep -q '^API_DB_PASSWORD=' .env; then
     printf '\n# Read-only database account for the API\nAPI_DB_PASSWORD=%s\n' "$(rand)" >> .env
-    echo "Added API_DB_PASSWORD to .env."
-  else
-    echo ".env is up to date."
+    echo "Added API_DB_PASSWORD to .env."; added=1
   fi
+  if ! grep -q '^OFFLINE_KEY=' .env; then
+    printf '\n# Shared with the Cloudflare offline Worker (offline/deploy.sh reads it from here)\nOFFLINE_KEY=%s\n' "$(rand)" >> .env
+    echo "Added OFFLINE_KEY to .env."; added=1
+  fi
+  [ "$added" = 1 ] || echo ".env is up to date."
   exit 0
 fi
 
@@ -29,6 +33,7 @@ sed -i.bak \
   -e "s|^RIS_CLIENT=.*|RIS_CLIENT=bgp-pipeline-$name|" \
   -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(rand)|" \
   -e "s|^S3_SECRET_KEY=.*|S3_SECRET_KEY=$(rand)|" \
-  -e "s|^API_DB_PASSWORD=.*|API_DB_PASSWORD=$(rand)|" .env
+  -e "s|^API_DB_PASSWORD=.*|API_DB_PASSWORD=$(rand)|" \
+  -e "s|^OFFLINE_KEY=.*|OFFLINE_KEY=$(rand)|" .env
 rm -f .env.bak
 echo "Created .env (secrets generated; never commit this file)."

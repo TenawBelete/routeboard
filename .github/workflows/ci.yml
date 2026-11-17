@@ -29,6 +29,9 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
       - run: cd web && npm ci && npm run build
+      # Known vulnerabilities in what ships to visitors (dev-only tools such as the Vite dev server are excluded).
+      - run: cd web && npm audit --omit=dev --audit-level=high
+      - run: node --test offline/worker.test.mjs
   compose:
     runs-on: ubuntu-latest
     steps:

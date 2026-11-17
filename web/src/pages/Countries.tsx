@@ -191,7 +191,7 @@ export default function Countries({ cc }: { cc: string | null }) {
           </div>
           {cc ? (
             <p className="mapstate" aria-live="polite">
-              {live.status !== "live" || !live.feedUp ? "The live stream is not connected, so no dots are moving."
+              {(live.status !== "live" && live.status !== "replay") || !live.feedUp ? "The live stream is not connected, so no dots are moving."
                 : mode === "live" ? <><b className="on" /> Live: these dots are route changes touching {name} right now.</>
                 : mode === "replay" ? <><b /> {name} is quiet at the moment. Replaying its last {recent.length} real route {recent.length === 1 ? "change" : "changes"} (most recent at {newest} UTC).</>
                 : <><b /> Listening. No route change touching {name} has arrived since the live service started.</>}

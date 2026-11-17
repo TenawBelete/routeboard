@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { apiUrl } from "./config";
+import { fromBundle, getBundle, markOffline, markOnline, serverGone } from "./offline";
 
 export interface Kpi { window_start: string; announcements: number; withdrawals: number; total_updates: number; withdraw_rate: number; updated_at: string }
 export interface Timeline { minutes: number; points: { window_start: string; announcements: number; withdrawals: number; total_updates: number; peak_withdrawals?: number }[] }
@@ -50,7 +52,7 @@ export interface Country {
 
 export type State<T> =
   | { kind: "loading" }
-  | { kind: "ok"; data: T; at: number }
+  | { kind: "ok"; data: T; at: number; saved?: boolean }   // saved: from the offline copy, `at` = when it was saved
   | { kind: "empty"; message: string }      // API reachable, job has not produced data yet (404)
   | { kind: "error"; message: string };     // API unreachable or failing
 
@@ -61,18 +63,35 @@ export function usePoll<T>(path: string, ms = 15000): State<T> {
     let stop = false;
     const load = async () => {
       try {
-        const r = await fetch(path, { headers: { Accept: "application/json" } });
+        const r = await fetch(apiUrl(path), { headers: { Accept: "application/json" } });
         if (stop) return;
-        if (r.status === 404) {
+        if (serverGone(r.status)) {
+          await showSaved();
+        } else if (r.status === 404) {
           const j = await r.json().catch(() => ({}));
           setState({ kind: "empty", message: j.detail ?? "no data yet" });
         } else if (!r.ok) {
           setState((s) => (s.kind === "ok" ? s : { kind: "error", message: `API answered ${r.status}` }));
         } else {
           setState({ kind: "ok", data: (await r.json()) as T, at: Date.now() });
+          markOnline();
         }
       } catch {
-        if (!stop) setState((s) => (s.kind === "ok" ? s : { kind: "error", message: "cannot reach the API" }));
+        if (!stop) await showSaved();
+      }
+    };
+    // The server is not there: show the copy saved by the offline Worker, if there is one.
+    const showSaved = async () => {
+      // The status page and health checks always report the real state, never a saved copy.
+      const live = /^\/(api\/status|health|live\/)/.test(path);
+      if (live) { const b = await getBundle(); if (b) markOffline(b.saved_at); }
+      const hit = live ? null : await fromBundle<T>(path);
+      if (stop) return;
+      if (hit) {
+        markOffline(hit.savedAt);
+        setState({ kind: "ok", data: hit.data, at: hit.savedAt * 1000, saved: true });
+      } else {
+        setState((s) => (s.kind === "ok" ? s : { kind: "error", message: "cannot reach the API" }));
       }
     };
     setState({ kind: "loading" });

@@ -5,12 +5,16 @@ seconds at the HTTP layer (Cache-Control) because the data changes once a
 minute at most.
 """
 
+import hmac
+import json
 import logging
+import time
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from xml.sax.saxutils import escape
 
@@ -33,25 +37,61 @@ app = FastAPI(
     version="1.0.0",
     description="Live BGP routing KPIs, AS-graph metrics and withdrawal-risk model output.",
     lifespan=lifespan,
-    docs_url="/api/docs",
-    openapi_url="/api/openapi.json",
+    docs_url="/api/docs" if settings.api_docs else None,
+    openapi_url="/api/openapi.json" if settings.api_docs else None,
     redoc_url=None,
 )
 
+# --- response cache -------------------------------------------------------------
+# The data changes at most once a minute, so identical requests within CACHE_FRESH seconds get the same
+# answer without touching the database. This is what stops a burst of visitors (or a bot) from turning
+# into a burst of expensive queries. Answers are kept longer (CACHE_KEEP) only to fill the offline bundle.
+CACHE_FRESH = 15
+CACHE_KEEP = 900
+CACHE_MAX = 1000
+_cache: dict[str, tuple[float, bytes, str]] = {}
+_UNCACHED = {"/api/offline-bundle"}
+
+
+def _evict(now: float) -> None:
+    if len(_cache) <= CACHE_MAX:
+        return
+    for k in [k for k, (t, _, _) in _cache.items() if now - t > CACHE_KEEP]:
+        _cache.pop(k, None)
+    if len(_cache) > CACHE_MAX:                      # still full: drop the oldest half
+        for k, _ in sorted(_cache.items(), key=lambda kv: kv[1][0])[: len(_cache) // 2]:
+            _cache.pop(k, None)
+
+
+@app.middleware("http")
+async def cache_and_headers(request: Request, call_next):
+    path = request.url.path
+    if request.method != "GET" or not path.startswith("/api/") or path in _UNCACHED:
+        return await call_next(request)
+    key = path + (f"?{request.url.query}" if request.url.query else "")
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < CACHE_FRESH:
+        return Response(hit[1], media_type=hit[2], headers={"Cache-Control": "public, max-age=5"})
+    response = await call_next(request)
+    if response.status_code != 200:
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    media = response.headers.get("content-type", "application/json")
+    _cache[key] = (now, body, media)
+    _evict(now)
+    headers = {k: v for k, v in response.headers.items() if k.lower() not in ("content-length", "content-type")}
+    headers.setdefault("cache-control", "public, max-age=5")
+    return Response(body, status_code=200, media_type=media, headers=headers)
+
+
+# Added after the cache so it wraps it: cached answers get CORS headers too.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
-
-
-@app.middleware("http")
-async def cache_headers(request: Request, call_next):
-    response: Response = await call_next(request)
-    if request.method == "GET" and response.status_code == 200 and request.url.path.startswith("/api/"):
-        response.headers.setdefault("Cache-Control", "public, max-age=5")
-    return response
 
 
 @app.exception_handler(Exception)
@@ -139,8 +179,11 @@ def events(days: int = Query(7, ge=1, le=90), limit: int = Query(100, ge=1, le=5
 @app.get("/api/events.atom", tags=["events"])
 def events_feed(request: Request):
     """Atom feed of recorded events, for feed readers and automations."""
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "localhost")
-    base = f"{request.headers.get('x-forwarded-proto', request.url.scheme)}://{host}"
+    if settings.site_url:
+        base = settings.site_url.rstrip("/")
+    else:  # local development only; production sets SITE_URL so links never come from request headers
+        base = f"{request.url.scheme}://{request.headers.get('host', 'localhost')}"
+    base = escape(base, {'"': "&quot;"})
     items = queries.events(24 * 14, 40)
     updated = (items[0]["started_at"] if items else datetime.now(timezone.utc)).isoformat()
     entries = "".join(
@@ -223,3 +266,46 @@ def model_predictions(limit: int = Query(20, ge=1, le=200)):
         raise HTTPException(404, "model job has not run yet")
     return {"run_id": run["run_id"], "trained_at": run["trained_at"],
             "items": queries.model_predictions(run["run_id"], limit)}
+
+
+# --- offline bundle ------------------------------------------------------------------
+# A Cloudflare Worker calls this every two minutes and keeps the answer. If this server stops, the
+# website (hosted by Cloudflare) shows that saved data, clearly marked with the time it was saved,
+# instead of an error page. The paths are exactly the ones the pages request, so the browser finds them.
+OFFLINE_PATHS = [
+    "/api/briefing", "/api/kpi/latest", "/api/kpi/timeline?minutes=60",
+    "/api/peers/top?limit=10&window_minutes=60", "/api/origins/top?limit=10&window_minutes=60",
+    "/api/graph/summary", "/api/graph/edges?core=70&limit=180", "/api/graph/edges?core=120&limit=320",
+    "/api/graph/edges?limit=10", "/api/graph/nodes?order_by=pagerank&limit=15",
+    "/api/events?days=7&limit=300", "/api/countries", "/api/country/US",
+    "/api/model/summary", "/api/model/predictions?limit=12", "/api/network/15169",
+]
+OFFLINE_EXTRA_MAX = 250   # plus whatever visitors opened in the last 15 minutes (countries, networks, events)
+
+
+@app.get("/api/offline-bundle", include_in_schema=False)
+async def offline_bundle(x_offline_key: str = Header("")):
+    if not settings.offline_key or not hmac.compare_digest(x_offline_key, settings.offline_key):
+        raise HTTPException(404, "not found")
+    import httpx
+    out: dict[str, object] = {}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://bundle") as client:
+        for path in OFFLINE_PATHS:
+            try:
+                r = await client.get(path)
+                if r.status_code == 200:
+                    out[path] = r.json()
+            except Exception as exc:
+                log.warning("offline bundle: %s failed (%s)", path, type(exc).__name__)
+    now = time.time()
+    extra = 0
+    for key, (t, body, media) in sorted(_cache.items(), key=lambda kv: -kv[1][0]):
+        if extra >= OFFLINE_EXTRA_MAX:
+            break
+        # Never the status: a saved "everything works" must not be shown while the server is down.
+        if key in out or key.startswith(("/api/search", "/api/status")) or now - t > CACHE_KEEP or not media.startswith("application/json"):
+            continue
+        out[key] = json.loads(body)
+        extra += 1
+    # Never stored by Cloudflare or anything else: it is only for the key holder, and must be fresh.
+    return JSONResponse({"saved_at": int(now), "api": jsonable_encoder(out)}, headers={"Cache-Control": "no-store"})

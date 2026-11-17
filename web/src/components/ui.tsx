@@ -1,4 +1,6 @@
 import { navigate } from "../nav";
+import { apiUrl } from "../config";
+import { fromBundle } from "../offline";
 import { ReactNode, useEffect, useRef, useState } from "react";
 import { CountryRow, Named, SearchHit, State, countryName, flag } from "../api";
 
@@ -40,7 +42,7 @@ const TRY: [string, string][] = [["Google", "/network/15169"], ["Cloudflare", "/
 // Countries are matched in the browser: any country whose name appears in what was typed,
 // so "show me the traffic of Eritrea" finds Eritrea. This is word matching, not a language model.
 let countryList: Promise<{ cc: string; name: string; key: string }[]> | null = null;
-const loadCountries = () => (countryList ??= fetch("/api/countries").then((r) => r.json())
+const loadCountries = () => (countryList ??= fetch(apiUrl("/api/countries")).then((r) => (r.ok ? r.json() : fromBundle<{ items: CountryRow[] }>("/api/countries").then((h) => h?.data ?? { items: [] })))
   .then((j) => (j.items as CountryRow[]).map((c) => ({ cc: c.country, name: countryName(c.country), key: countryName(c.country).toLowerCase() })))
   .catch(() => { countryList = null; return []; }));
 export function matchCountries(q: string, all: { cc: string; name: string; key: string }[]) {
@@ -63,7 +65,7 @@ export function Search({ autoFocus = false }: { autoFocus?: boolean }) {
     const mine = ++seq.current;
     const id = setTimeout(async () => {
       try {
-        const [r, all] = await Promise.all([fetch(`/api/search?q=${encodeURIComponent(term.slice(0, 60))}`), loadCountries()]);
+        const [r, all] = await Promise.all([fetch(apiUrl(`/api/search?q=${encodeURIComponent(term.slice(0, 60))}`)).catch(() => new Response("{}", { status: 503 })), loadCountries()]);
         const j = r.ok ? await r.json() : { items: [] };
         const cs: Hit[] = matchCountries(term, all).map((c) => ({ href: `/country/${c.cc}`, title: `${flag(c.cc)} ${c.name}`, sub: "How this country connects", tag: "Country" }));
         const ns: Hit[] = (j.items as SearchHit[]).map((h) => ({ href: `/network/${h.asn}`, title: h.name ?? "Unnamed network", sub: `${flag(h.country)} ${countryName(h.country)}`, tag: `AS${h.asn}` }));

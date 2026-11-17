@@ -9,7 +9,10 @@ class Settings(BaseSettings):
     postgres_password: str
     api_db_user: str = "bgp_api"       # read-only login, used when api_db_password is set
     api_db_password: str = ""
-    cors_origins: str = "*"            # comma-separated; "*" only for local dev
+    cors_origins: str = "*"            # comma-separated; "*" only for local dev. Production: https://butenai.com,https://www.butenai.com
+    api_docs: bool = True              # interactive docs at /api/docs; turned off in production (docker-compose.prod.yml)
+    site_url: str = ""                 # public address used in feed links, e.g. https://butenai.com (never taken from request headers in production)
+    offline_key: str = ""              # shared with the Cloudflare Worker that saves the offline bundle; empty = disabled
     freshness_warn_seconds: int = 180  # /health reports degraded above this
     pool_min: int = 1
     pool_max: int = 8

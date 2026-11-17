@@ -1,0 +1,16 @@
+# Deployed by ./deploy.sh (it fills in the KV id and the secret for you).
+name = "routeboard-offline"
+main = "worker.js"
+compatibility_date = "2026-06-01"
+workers_dev = false
+routes = [{ pattern = "data.butenai.com", custom_domain = true }]
+
+[triggers]
+crons = ["*/2 * * * *"]   # every 2 minutes = 720 KV writes a day (free limit: 1,000)
+
+[vars]
+ORIGIN = "https://api.butenai.com"
+
+[[kv_namespaces]]
+binding = "SNAPSHOT"
+id = "REPLACE_WITH_KV_ID"
