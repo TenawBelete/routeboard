@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with: { distribution: temurin, java-version: "17" }
       - run: pip install pyspark==3.5.3 pytest
       - run: cd spark && LAKE_FORMAT=parquet POSTGRES_DB=x POSTGRES_USER=x POSTGRES_PASSWORD=x python -m pytest -q tests
