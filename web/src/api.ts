@@ -61,6 +61,7 @@ export function usePoll<T>(path: string, ms = 15000): State<T> {
   const [state, setState] = useState<State<T>>({ kind: "loading" });
   useEffect(() => {
     let stop = false;
+    let retries = 0;
     const load = async () => {
       try {
         const r = await fetch(apiUrl(path), { headers: { Accept: "application/json" } });
@@ -74,7 +75,9 @@ export function usePoll<T>(path: string, ms = 15000): State<T> {
           setState((s) => (s.kind === "ok" ? s : { kind: "error", message: `API answered ${r.status}` }));
         } else {
           setState({ kind: "ok", data: (await r.json()) as T, at: Date.now() });
-          markOnline();
+          // Only a health or status check proves the server is back: other answers can be
+          // older copies that Cloudflare's cache serves while the server is away.
+          if (/^\/(health|api\/status)/.test(path)) markOnline();
         }
       } catch {
         if (!stop) await showSaved();
@@ -92,6 +95,8 @@ export function usePoll<T>(path: string, ms = 15000): State<T> {
         setState({ kind: "ok", data: hit.data, at: hit.savedAt * 1000, saved: true });
       } else {
         setState((s) => (s.kind === "ok" ? s : { kind: "error", message: "cannot reach the API" }));
+        // Do not wait for the next regular refresh (up to minutes): try again shortly.
+        if (!live && retries++ < 5) setTimeout(() => { if (!stop) void load(); }, 3000);
       }
     };
     setState({ kind: "loading" });
