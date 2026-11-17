@@ -136,8 +136,13 @@ class Stream {
     this.es?.close(); this.es = null;
     if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
     this.probeTimer = setInterval(() => void this.probe(), PROBE_MS);
+    await this.startReplay();
+  }
+
+  /** Load the saved copy and play it. If it cannot be loaded yet, the next probe tries again. */
+  private async startReplay() {
     const b = await getBundle();
-    if (this.mode !== "replay") return;
+    if (this.mode !== "replay" || this.replayTimer) return;
     const r = b?.replay;
     if (!b || !r || r.ticks.length === 0) { this.set({ status: "down" }); return; }
     markOffline(b.saved_at);
@@ -164,8 +169,9 @@ class Stream {
       const q = new URLSearchParams({ after: "0" });
       if (this.scope) q.set("country", this.scope);
       const r = await fetch(apiUrl(`/live/snapshot?${q}`), { cache: "no-store" });
-      if (r.ok) this.leaveReplay();
+      if (r.ok) { this.leaveReplay(); return; }
     } catch { /* still away */ }
+    if (!this.replayTimer) await this.startReplay();   // the saved copy could not be loaded before: try again
   }
 
   private leaveReplay() {

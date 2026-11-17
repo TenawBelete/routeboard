@@ -20,7 +20,8 @@ export function getBundle(): Promise<Bundle | null> {
     fetchedAt = Date.now();
     bundle = fetch(OFFLINE_URL, { cache: "no-store" })
       .then((r) => (r.ok ? (r.json() as Promise<Bundle>) : null))
-      .catch(() => null);
+      .catch(() => null)
+      .then((b) => { if (!b) fetchedAt = 0; return b; });   // a failed fetch is retried next time, not remembered for a minute
   }
   return bundle;
 }

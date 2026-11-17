@@ -6,7 +6,8 @@ cd "$(dirname "$0")"
 W="npx --yes wrangler@4"
 
 echo "== 1/4 Cloudflare login (a browser window opens the first time)"
-$W whoami >/dev/null 2>&1 || $W login
+# "whoami" exits 0 even when logged out, so look for the e-mail line it prints when logged in.
+if ! $W whoami 2>&1 | grep -qi "associated with the email"; then $W login; fi
 
 echo "== 2/4 Storage for the saved copy (Workers KV)"
 if grep -q REPLACE_WITH_KV_ID wrangler.toml; then
